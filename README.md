@@ -250,7 +250,7 @@ GET /api/v1/health/ready
 | `AUTOMATION_CENTER_COOKIE_SECURE` | `true` | 本地 HTTP 开发必须设为 `false` |
 | `AUTOMATION_CENTER_SALT_MODE` | `fake` | `fake` 或 `http` |
 | `AUTOMATION_CENTER_SALT_API_URL` | `http://127.0.0.1:8000` | salt-api 地址 |
-| `AUTOMATION_CENTER_SALT_API_USERNAME` | `automation` | salt-api eAuth 用户 |
+| `AUTOMATION_CENTER_SALT_API_USERNAME` | `automation` | salt-api eAuth 用户；生产示例显式使用专用账号 `automation-center` |
 | `AUTOMATION_CENTER_SALT_API_CREDENTIAL` | 空 | salt-api credential；数据库中加密保存 |
 | `AUTOMATION_CENTER_SALT_EAUTH` | `file` | salt-api 外部认证类型 |
 | `AUTOMATION_CENTER_STARTUP_MIGRATE` | `true` | 启动时执行备份和 Alembic 迁移 |
@@ -310,6 +310,8 @@ npm run test:e2e
 ## 文档
 
 - [后端开发者快速上手](docs/developer-onboarding.md)
+- [192.168.200.11 容器部署手册](docs/deployment-192.168.200.11.md)
+- [192.168.200.11/12 真实 Salt 验收手册](docs/acceptance-192.168.200.11-12.md)
 - [测试用例](docs/test-cases.md)
 - [需求—接口—测试追踪矩阵](docs/requirements-traceability.md)
 - [需求规格说明书](需求文档.md)
@@ -339,5 +341,5 @@ docker exec automation-center automation-center reset-password --username admin 
 手工创建 SQLite 备份：
 
 ```bash
-docker exec automation-center automation-center backup
+docker exec automation-center automation-center backup-db
 ```

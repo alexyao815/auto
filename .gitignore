@@ -15,6 +15,7 @@ frontend/test-results/
 *.tsbuildinfo
 .env
 certs/*.key
+certs/*.crt
 data/
 .build/
 /1 自动化中心.md
