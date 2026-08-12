@@ -1,6 +1,8 @@
 export type ApiProblem = { status: number; detail: string | unknown }
+export type ApiRequestOptions = RequestInit & { timeoutMs?: number }
 
 const API_ROOT = '/api/v1'
+export const AUTH_EXPIRED_EVENT = 'automation-center:auth-expired'
 
 export function setCsrfToken(token: string) {
   // Session Cookie 为 HttpOnly，CSRF Token 则只保存在当前标签页并显式放入写请求头。
@@ -15,7 +17,8 @@ export function getCsrfToken() {
   return sessionStorage.getItem('automation-center-csrf') || ''
 }
 
-export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function api<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const { timeoutMs = 0, ...requestOptions } = options
   const headers = new Headers(options.headers)
   if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
@@ -26,13 +29,26 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     const csrf = getCsrfToken()
     if (csrf) headers.set('X-CSRF-Token', csrf)
   }
-  const response = await fetch(`${API_ROOT}${path}`, { ...options, headers, credentials: 'include' })
+  const controller = timeoutMs > 0 ? new AbortController() : undefined
+  const timeout = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : undefined
+  let signal = requestOptions.signal
+  if (controller) signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+  let response: Response
+  try {
+    response = await fetch(`${API_ROOT}${path}`, { ...requestOptions, headers, signal, credentials: 'include' })
+  } finally {
+    if (timeout !== undefined) window.clearTimeout(timeout)
+  }
   if (response.status === 204) return undefined as T
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
     const error = new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data)) as Error & ApiProblem
     error.status = response.status
     error.detail = data.detail
+    if (response.status === 401) {
+      clearCsrfToken()
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+    }
     throw error
   }
   return data as T

@@ -1,7 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { api } from './api'
 import LoginView from './views/LoginView.vue'
 import AppLayout from './components/AppLayout.vue'
+import { pinia } from './stores'
+import { useAuthStore } from './stores/auth'
 
 const DashboardView = () => import('./views/DashboardView.vue')
 const NodesView = () => import('./views/NodesView.vue')
@@ -34,13 +35,10 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   if (!to.matched.some((record) => record.meta.auth)) return true
-  // 路由进入前以服务端 Session 为准，不能只依赖前端缓存推断登录状态。
-  try {
-    await api('/auth/me')
-    return true
-  } catch {
-    return { path: '/login', query: { redirect: to.fullPath } }
-  }
+  // 首次进入时由服务端确认 Session；同标签页内后续导航复用结果，业务 API 的
+  // 401 仍会立即清除缓存并跳转登录页，不能只依赖缓存维持失效会话。
+  const authenticated = await useAuthStore(pinia).ensureSession()
+  return authenticated || { path: '/login', query: { redirect: to.fullPath } }
 })
 
 export default router

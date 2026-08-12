@@ -16,6 +16,9 @@ from sqlalchemy import create_engine
 from .config import Settings
 
 
+SQLITE_BUSY_TIMEOUT_MS = 5_000
+
+
 class Base(DeclarativeBase):
     """所有 ORM 模型共享的声明式基类。"""
 
@@ -23,24 +26,43 @@ class Base(DeclarativeBase):
 
 
 def create_db_engine(settings: Settings) -> Engine:
-    """创建数据库引擎，并为 SQLite 连接设置并发与完整性约束。"""
+    """创建数据库引擎，并为 SQLite 设置并发与完整性约束。
 
-    connect_args = {"check_same_thread": False, "timeout": 30} if settings.database_url.startswith("sqlite") else {}
+    ``journal_mode`` 是数据库级持久设置，只能在应用启动、尚无并发请求时设置
+    一次。若在每条新连接上重复切换 WAL，并发建立连接时该 PRAGMA 自身会争用
+    数据库锁，最终让登录等短请求等待几十秒。
+    """
+
+    connect_args = {
+        "check_same_thread": False,
+        "timeout": SQLITE_BUSY_TIMEOUT_MS / 1000,
+    } if settings.database_url.startswith("sqlite") else {}
     engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 
     if settings.database_url.startswith("sqlite"):
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragmas(dbapi_connection: sqlite3.Connection, _: object) -> None:
-            """对连接池中新建的每条 SQLite 连接重复设置连接级 PRAGMA。"""
+            """为连接池中新建的每条连接设置连接级 PRAGMA。"""
 
-            # WAL 允许读写并行；foreign_keys 让快照/删除语义真正由数据库约束。
+            # foreign_keys 和 busy_timeout 都是连接级设置，必须逐连接应用。
             cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             cursor.close()
 
+        # 此时 Scheduler 和 HTTP Server 尚未启动，可以安全地一次性启用 WAL。
+        with engine.connect() as connection:
+            journal_mode = connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one()
+            if str(journal_mode).lower() != "wal":
+                raise RuntimeError(f"SQLite WAL 启用失败，当前模式为 {journal_mode}")
+
     return engine
+
+
+def is_sqlite_locked(error: BaseException) -> bool:
+    """判断 SQLAlchemy/SQLite 异常是否属于可重试的写锁竞争。"""
+
+    return "database is locked" in str(error).lower()
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

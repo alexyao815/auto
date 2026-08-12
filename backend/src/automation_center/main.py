@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,11 +13,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from . import __version__
 from .api import create_api_router
 from .config import Settings
-from .database import Base, backup_sqlite, create_db_engine, create_session_factory, run_migrations, session_dependency
+from .database import Base, backup_sqlite, create_db_engine, create_session_factory, is_sqlite_locked, run_migrations, session_dependency
 from .models import RoleRule, SystemSetting
 from .salt import SaltAdapter, create_salt_adapter
 from .scheduler import Scheduler
@@ -29,6 +32,7 @@ DEFAULT_ROLE_RULES = [
     {"role": "network", "matcher_type": "process", "pattern": "ovs-vswitchd"},
     {"role": "controller", "matcher_type": "process", "pattern": "nova-api"},
 ]
+logger = logging.getLogger(__name__)
 
 
 def seed_defaults(factory, settings: Settings) -> None:
@@ -140,6 +144,16 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
     require_session, require_csrf = build_auth_dependencies(settings, get_session)
     app.include_router(create_api_router(settings, get_session, salt, require_session, require_csrf))
 
+    @app.middleware("http")
+    async def attach_request_id(request: Request, call_next):
+        """贯穿代理、应用日志和响应返回同一个无敏感信息的请求标识。"""
+
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
         """把业务 HTTP 异常统一转换为可机器解析的错误结构。"""
@@ -155,6 +169,53 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
         return JSONResponse(
             status_code=422,
             content={"type": "about:blank", "title": "参数校验失败", "status": 422, "detail": exc.errors(), "instance": str(request.url.path)},
+        )
+
+    @app.exception_handler(OperationalError)
+    async def database_operational_error(request: Request, exc: OperationalError):
+        """把 SQLite 锁竞争快速转换为可重试响应，其余数据库错误保留异常栈。"""
+
+        request_id = getattr(request.state, "request_id", "")
+        if is_sqlite_locked(exc):
+            logger.warning("SQLite 写锁超时 request_id=%s path=%s", request_id, request.url.path)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "about:blank",
+                    "title": "服务暂时繁忙",
+                    "status": 503,
+                    "detail": "数据库正在处理其他写操作，请稍后重试",
+                    "instance": str(request.url.path),
+                },
+                headers={"Retry-After": "1", "X-Request-ID": request_id},
+            )
+        logger.error(
+            "数据库操作异常 request_id=%s path=%s",
+            request_id,
+            request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"type": "about:blank", "title": "服务器错误", "status": 500, "detail": "数据库操作失败", "instance": str(request.url.path)},
+            headers={"X-Request-ID": request_id},
+        )
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception):
+        """记录未预期异常栈，同时避免把内部路径或凭据暴露给浏览器。"""
+
+        request_id = getattr(request.state, "request_id", "")
+        logger.error(
+            "未处理异常 request_id=%s path=%s",
+            request_id,
+            request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"type": "about:blank", "title": "服务器错误", "status": 500, "detail": "服务器内部错误", "instance": str(request.url.path)},
+            headers={"X-Request-ID": request_id},
         )
 
     return app

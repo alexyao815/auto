@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+import time
+
 from automation_center.models import Node, TaskNode
 
 from .conftest import build_bundle
@@ -8,6 +11,21 @@ from .conftest import build_bundle
 def upload(client, auth, bundle):
     with bundle.open("rb") as stream:
         return client.post("/api/v1/packages", files={"file": (bundle.name, stream, "application/gzip")}, headers=auth)
+
+
+def test_sqlite_write_lock_returns_retryable_503(client, settings):
+    database_path = settings.database_url.removeprefix("sqlite:///")
+    with sqlite3.connect(database_path, timeout=0) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.perf_counter()
+        response = client.post("/api/v1/auth/login", json={"username": "admin", "password": "wrong"})
+        elapsed = time.perf_counter() - started
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.headers["X-Request-ID"]
+    assert response.json()["detail"] == "数据库正在处理其他写操作，请稍后重试"
+    assert 4.5 <= elapsed < 7
 
 
 def test_node_manual_roles_restore_disable_and_delete(client, auth):

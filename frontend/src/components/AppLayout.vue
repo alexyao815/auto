@@ -2,9 +2,11 @@
 import { useRoute, useRouter } from 'vue-router'
 import { api, clearCsrfToken } from '../api'
 import { ElMessage } from 'element-plus'
+import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
 const nav = [
   ['/dashboard', '运行总览'], ['/nodes', '节点中心'], ['/packages', '维护包中心'],
   ['/tasks', '任务中心'], ['/settings', '系统设置'], ['/audit', '操作审计'],
@@ -13,6 +15,7 @@ const nav = [
 async function logout() {
   try { await api('/auth/logout', { method: 'POST' }) } catch { /* session may already be gone */ }
   clearCsrfToken()
+  auth.markLoggedOut()
   ElMessage.success('已退出登录')
   router.replace('/login')
 }
@@ -33,4 +36,3 @@ async function logout() {
     </main>
   </div>
 </template>
-

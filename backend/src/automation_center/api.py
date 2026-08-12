@@ -29,6 +29,7 @@ from .models import (
     TaskStepResult,
     utcnow,
 )
+from .node_service import apply_node_snapshots, collect_node_snapshots, probe_node
 from .package_service import create_package, delete_package, update_package
 from .salt import SaltAdapter
 from .security import create_login_session, decrypt_secret, encrypt_secret, sha256_text, verify_password
@@ -311,18 +312,10 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
     def accept_node(key_id: str, request: Request, session: Session = Depends(get_session)):
         """接受 Minion Key，发现节点属性并执行首次角色识别。"""
         salt.accept_key(key_id)
-        info = salt.node_info(key_id)
-        node = session.get(Node, key_id) or Node(id=key_id, hostname=info.get("hostname", key_id))
-        node.hostname = info.get("hostname", key_id)
-        node.management_ip = info.get("management_ip")
-        node.online_status = "ONLINE" if salt.ping(key_id) else "OFFLINE"
-        node.last_check_time = utcnow()
-        session.add(node)
-        session.flush()
-        detect_roles(session, node, info.get("processes", []), info.get("services", []))
+        snapshot = probe_node(salt, key_id)
+        node = next(node for node in apply_node_snapshots(session, [snapshot]) if node.id == key_id)
         audit(session, request, "ACCEPT_NODE", "NODE", key_id)
         session.commit()
-        session.refresh(node)
         return serialize_node(node)
 
     @protected.post("/nodes/pending/{key_id}/reject", dependencies=[Depends(require_csrf)], summary="拒绝节点 Key")
@@ -341,26 +334,11 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
 
     @protected.post("/nodes/refresh", dependencies=[Depends(require_csrf)], summary="立即刷新节点")
     def refresh_nodes(request: Request, session: Session = Depends(get_session)):
-        """立即向 Salt 探测节点在线状态、属性和自动角色。"""
-        for node_id in salt.accepted_keys():
-            if session.get(Node, node_id) is None:
-                try:
-                    info = salt.node_info(node_id)
-                except Exception:
-                    info = {"hostname": node_id, "management_ip": None, "processes": []}
-                node = Node(id=node_id, hostname=info.get("hostname", node_id), management_ip=info.get("management_ip"))
-                session.add(node)
-                session.flush()
-                detect_roles(session, node, info.get("processes", []), info.get("services", []))
-        nodes = session.scalars(select(Node).options(selectinload(Node.roles))).unique().all()
-        for node in nodes:
-            node.online_status = "ONLINE" if salt.ping(node.id) else "OFFLINE"
-            node.last_check_time = utcnow()
-            if node.online_status == "ONLINE" and not node.role_override:
-                info = salt.node_info(node.id)
-                node.hostname = info.get("hostname", node.hostname)
-                node.management_ip = info.get("management_ip", node.management_ip)
-                detect_roles(session, node, info.get("processes", []), info.get("services", []))
+        """先结束认证事务并探测 Salt，再以短事务更新节点事实。"""
+        known_ids = set(session.scalars(select(Node.id)))
+        session.rollback()
+        snapshots = collect_node_snapshots(salt, known_ids)
+        nodes = apply_node_snapshots(session, snapshots)
         audit(session, request, "REFRESH_NODES", "NODE", None, {"count": len(nodes)})
         session.commit()
         return [serialize_node(node) for node in nodes]
@@ -691,18 +669,3 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
 
     api.include_router(protected)
     return api
-
-
-def detect_roles(session: Session, node: Node, processes: list[str], services: list[str] | None = None) -> None:
-    """按启用规则重建节点的 auto 角色，不触碰 manual 角色记录。"""
-    rules = list(session.scalars(select(RoleRule).where(RoleRule.enabled.is_(True))))
-    process_text = "\n".join(processes).lower()
-    service_text = "\n".join(services or []).lower()
-    detected = sorted({
-        rule.role
-        for rule in rules
-        if rule.pattern.lower() in (service_text if rule.matcher_type == "service" else process_text)
-    })
-    node.roles[:] = [role for role in node.roles if role.source != "auto"]
-    for role in detected:
-        node.roles.append(NodeRole(role=role, source="auto"))

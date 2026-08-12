@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import threading
 import time
@@ -22,8 +23,6 @@ from .models import (
     NodeExecutionLock,
     Package,
     PackageStep,
-    NodeRole,
-    RoleRule,
     SystemSetting,
     Task,
     TaskAttempt,
@@ -31,8 +30,12 @@ from .models import (
     TaskStepResult,
     utcnow,
 )
+from .node_service import apply_node_snapshots, collect_node_snapshots
 from .salt import SaltAdapter
 from .task_service import aggregate_task
+
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -62,7 +65,7 @@ class Scheduler:
                 await self.cleanup_expired()
             except Exception:
                 # 单个执行失败由 Worker 落库，不能让异常终止整个调度循环。
-                pass
+                logger.exception("Scheduler 主循环执行失败，将在下一个周期重试")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.settings.scheduler_interval_seconds)
             except TimeoutError:
@@ -77,33 +80,13 @@ class Scheduler:
         await asyncio.to_thread(self._refresh_nodes_sync)
 
     def _refresh_nodes_sync(self) -> None:
-        """同步发现已接受 Minion，并在一个短写事务中更新节点及自动角色。"""
-        accepted = self.salt.accepted_keys()
+        """先在事务外探测 Salt，再用单个短事务更新节点和自动角色。"""
+
         with self.factory() as session:
-            rules = list(session.scalars(select(RoleRule).where(RoleRule.enabled.is_(True))))
-            for node_id in accepted:
-                node = session.get(Node, node_id)
-                online = self.salt.ping(node_id)
-                info = self.salt.node_info(node_id) if online else {"hostname": node_id, "management_ip": None, "processes": [], "services": []}
-                if node is None:
-                    node = Node(id=node_id, hostname=info.get("hostname", node_id))
-                    session.add(node)
-                    session.flush()
-                node.hostname = info.get("hostname", node.hostname)
-                node.management_ip = info.get("management_ip", node.management_ip)
-                node.online_status = "ONLINE" if online else "OFFLINE"
-                node.last_check_time = utcnow()
-                if online and not node.role_override:
-                    # 人工角色是显式决策；只有未 override 的节点才重建 auto 角色。
-                    process_text = "\n".join(info.get("processes", [])).lower()
-                    service_text = "\n".join(info.get("services", [])).lower()
-                    node.roles[:] = [role for role in node.roles if role.source != "auto"]
-                    for role_name in sorted({
-                        rule.role
-                        for rule in rules
-                        if rule.pattern.lower() in (service_text if rule.matcher_type == "service" else process_text)
-                    }):
-                        node.roles.append(NodeRole(role=role_name, source="auto"))
+            known_ids = set(session.scalars(select(Node.id)))
+        snapshots = collect_node_snapshots(self.salt, known_ids)
+        with self.factory() as session:
+            apply_node_snapshots(session, snapshots)
             session.commit()
 
     async def stop(self) -> None:

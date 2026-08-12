@@ -114,7 +114,20 @@ sh deploy/salt/verify-salt-api.sh | tee "$EVIDENCE_DIR/A-01-salt-api.txt"
 3. 使用固定测试账号 `admin/admin` 登录。
 4. 打开 Dashboard，确认页面没有 API 错误。
 
-预期：登录成功，浏览器只保存 Secure/HttpOnly Session Cookie；页面时间按 Asia/Shanghai 展示。
+随后在 `.11` 执行自动性能和页面 API 回归；脚本不会打印密码、Token 或 Cookie：
+
+```bash
+cd /opt/automation-center
+APP_URL=https://192.168.200.11:8443 \
+APP_USERNAME=admin APP_PASSWORD=admin \
+sh deploy/scripts/auth-ui-validate.sh \
+  | tee "$EVIDENCE_DIR/A-02-auth-ui.txt"
+docker logs --since 10m automation-center 2>&1 \
+  | grep -E 'auth/login|auth/me|database is locked|SQLite 写锁|未处理异常' \
+  | tee "$EVIDENCE_DIR/A-02-auth-log.txt"
+```
+
+预期：登录成功，浏览器只保存 Secure/HttpOnly Session Cookie；页面时间按 Asia/Shanghai 展示；登录小于 1 秒；20 个并发 `/auth/me` 全部 200 且最大耗时小于 2 秒；Dashboard、节点、维护包、任务、设置和审计 API 都小于 2 秒；日志无 500 和 SQLite 锁错误。
 
 ### A-03 节点发现
 

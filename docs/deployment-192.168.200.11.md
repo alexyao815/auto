@@ -405,12 +405,16 @@ systemctl is-enabled firewalld || true
 ```bash
 cd /opt/automation-center
 docker compose config >/dev/null
-docker compose build --pull
+docker image inspect node:22-bookworm-slim python:3.12-slim-bookworm \
+  --format '{{index .RepoTags 0}} {{.Id}} {{.Os}}/{{.Architecture}}'
+docker compose build
 docker image inspect automation-center:1.0.0 \
   --format 'IMAGE_ID={{.Id}} CREATED={{.Created}}' | tee /root/automation-center-image.txt
 ```
 
-预期结果：Compose 配置可解析，前后端依赖安装和 Vite 构建完成，镜像 ID 被记录。
+预期结果：两个基础镜像的精确 Tag、ID 和平台可显示；Compose 配置可解析，前后端依赖安装和 Vite 构建完成，镜像 ID 被记录。
+
+这里默认不加 `--pull`：该选项会强制查询 Docker Hub 的远端元数据，即使本机已有同名镜像，在无法连接 `registry-1.docker.io` 时仍会失败。只有明确需要更新基础镜像且 Docker daemon 代理已经验证可用时，才执行 `docker compose build --pull`。
 
 停止条件：构建失败或输出中出现真实凭据。不要在故障单中粘贴 `docker compose config` 的完整环境变量部分。
 
@@ -500,7 +504,7 @@ mv /opt/automation-center "$OLD_SOURCE_DIR"
 mv "$NEW_SOURCE_DIR" /opt/automation-center
 cd /opt/automation-center
 docker compose config >/dev/null
-docker compose build --pull
+docker compose build
 docker compose up -d
 mv /root/automation-center-source.sha256.new /root/automation-center-source.sha256
 printf '%s\n' "$SOURCE_URL" > /root/automation-center-source-url.txt
@@ -598,6 +602,30 @@ systemctl is-active salt-master salt-api
 ```
 
 执行回滚前必须确认 `backup_dir` 是第 5.1 节生成的精确绝对路径。上述操作只恢复 Salt 配置，不删除 Automation Center 数据。
+
+### 13.5 登录慢或页面点击无响应
+
+**这一步做什么：**把密码校验、SQLite 写锁、后端处理和浏览器页面加载分开检查。新版本 Nginx 日志中的 `request_time` 是完整请求耗时，`upstream_time` 是 FastAPI 耗时，`request_id` 可关联应用异常；日志不会包含登录密码、Session Cookie 或 CSRF Token。
+
+先检查最近认证请求是否出现 500、503 或长耗时：
+
+```bash
+docker logs --since 15m automation-center 2>&1 \
+  | grep -E 'auth/login|auth/me|database is locked|SQLite 写锁|未处理异常'
+```
+
+测试环境使用固定 Web 账号 `admin/admin` 时，执行自动性能与页面 API 验证：
+
+```bash
+cd /opt/automation-center
+APP_URL=https://192.168.200.11:8443 \
+APP_USERNAME=admin APP_PASSWORD=admin \
+sh deploy/scripts/auth-ui-validate.sh
+```
+
+这段验证会创建一次登录 Session 和 LOGIN/LOGOUT 审计，读取所有主要页面 API，并执行一次“立即探测”；不会上传 Package、创建 Task 或修改 Settings。预期登录小于 1 秒，20 个并发 `/auth/me` 全部为 200 且最大耗时小于 2 秒，最后输出 `authentication and page API validation passed`。
+
+停止条件：任何 500、`database is locked`、登录超过 1 秒、`auth/me` 超过 2 秒，或脚本退出非 0。保存脚本输出和对应时间段容器日志后再继续定位，不要反复点击登录按钮制造更多并发请求。
 
 ## 14. 部署完成标准
 

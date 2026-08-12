@@ -27,6 +27,36 @@ def ensure_node(client, auth):
     client.post("/api/v1/nodes/refresh", headers=auth)
 
 
+def test_node_refresh_releases_sqlite_connection_before_salt_calls(client, auth, salt, monkeypatch):
+    engine = client.app.state.engine
+    original_accepted_keys = salt.accepted_keys
+    original_ping = salt.ping
+    original_node_info = salt.node_info
+
+    def assert_no_checked_out_connection():
+        # Salt 回调期间连接池应为空；数据库读写只发生在探测前后的短阶段。
+        assert engine.pool.checkedout() == 0
+
+    def accepted_keys():
+        assert_no_checked_out_connection()
+        return original_accepted_keys()
+
+    def ping(node_id):
+        assert_no_checked_out_connection()
+        return original_ping(node_id)
+
+    def node_info(node_id):
+        assert_no_checked_out_connection()
+        return original_node_info(node_id)
+
+    monkeypatch.setattr(salt, "accepted_keys", accepted_keys)
+    monkeypatch.setattr(salt, "ping", ping)
+    monkeypatch.setattr(salt, "node_info", node_info)
+
+    assert client.post("/api/v1/nodes/refresh", headers=auth).status_code == 200
+    client.app.state.scheduler._refresh_nodes_sync()
+
+
 def test_failure_retry_fifo_and_ignore(client, auth, tmp_path):
     ensure_node(client, auth)
     failed_package = upload(client, auth, build_bundle(tmp_path, name="fail-package", script="scripts/fail.sh"))

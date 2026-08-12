@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import threading
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.orm import Session
 
-from automation_center.models import Task, TaskAttempt, TaskNode
+from automation_center.models import SessionRecord, Task, TaskAttempt, TaskNode, utcnow
 from automation_center.scheduler import Scheduler
 from automation_center.task_service import cancel_task_node, create_task
 
@@ -47,6 +49,57 @@ def test_concurrent_idempotent_create_returns_one_task(client, auth, tmp_path):
     assert sorted(replayed for _, replayed in results) == [False, True]
     with factory() as session:
         assert session.scalar(select(func.count(Task.id)).where(Task.idempotency_key == "same-key")) == 1
+
+
+def test_concurrent_session_reads_do_not_compete_for_sqlite_writes(client):
+    login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-password"})
+    assert login.status_code == 200
+    factory = client.app.state.session_factory
+    with factory() as session:
+        before = session.scalar(select(SessionRecord).order_by(SessionRecord.created_at.desc())).last_seen_at
+
+    # 新登录的 last_seen 尚在 60 秒刷新窗口内，32 个并发读取都不应写 Session。
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        responses = list(pool.map(lambda _: client.get("/api/v1/auth/me"), range(32)))
+
+    assert all(response.status_code == 200 for response in responses)
+    with factory() as session:
+        after = session.scalar(select(SessionRecord).order_by(SessionRecord.created_at.desc())).last_seen_at
+    assert after == before
+
+
+def test_session_touch_is_throttled_but_still_slides_idle_expiry(client):
+    login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-password"})
+    assert login.status_code == 200
+    factory = client.app.state.session_factory
+    with factory() as session:
+        record = session.scalar(select(SessionRecord).order_by(SessionRecord.created_at.desc()))
+        record.last_seen_at = utcnow() - timedelta(seconds=61)
+        old_idle_expiry = record.idle_expires_at
+        session.commit()
+
+    assert client.get("/api/v1/auth/me").status_code == 200
+    with factory() as session:
+        touched = session.scalar(select(SessionRecord).order_by(SessionRecord.created_at.desc()))
+        assert touched.last_seen_at > utcnow() - timedelta(seconds=5)
+        assert touched.idle_expires_at > old_idle_expiry
+
+
+def test_successful_login_commits_session_and_audit_once(client):
+    commits = 0
+
+    def count_commit(_session):
+        nonlocal commits
+        commits += 1
+
+    event.listen(Session, "after_commit", count_commit)
+    try:
+        response = client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-password"})
+    finally:
+        event.remove(Session, "after_commit", count_commit)
+
+    assert response.status_code == 200
+    assert commits == 1
 
 
 def test_duplicate_scheduler_claim_creates_one_attempt(client, auth, salt, settings, tmp_path):
