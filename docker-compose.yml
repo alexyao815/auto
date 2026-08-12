@@ -1,0 +1,25 @@
+services:
+  automation-center:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: automation-center:1.0.0
+    container_name: automation-center
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      AUTOMATION_CENTER_DATA_DIR: /var/lib/automation-center
+      AUTOMATION_CENTER_SALT_MODE: http
+      AUTOMATION_CENTER_SALT_API_URL: http://127.0.0.1:8000
+      AUTOMATION_CENTER_SALT_API_USERNAME: automation
+      AUTOMATION_CENTER_SALT_EAUTH: file
+      AUTOMATION_CENTER_COOKIE_SECURE: "true"
+      AUTOMATION_CENTER_INITIAL_USERNAME: ${AUTOMATION_CENTER_INITIAL_USERNAME:?required}
+      AUTOMATION_CENTER_INITIAL_PASSWORD: ${AUTOMATION_CENTER_INITIAL_PASSWORD:?required}
+      AUTOMATION_CENTER_APP_SECRET: ${AUTOMATION_CENTER_APP_SECRET:?required}
+      AUTOMATION_CENTER_SALT_API_CREDENTIAL: ${AUTOMATION_CENTER_SALT_API_CREDENTIAL:?required}
+    volumes:
+      - /var/lib/automation-center:/var/lib/automation-center
+      - ./certs/tls.crt:/run/secrets/tls.crt:ro
+      - ./certs/tls.key:/run/secrets/tls.key:ro
+

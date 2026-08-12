@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automation-center"
+version = "1.0.0"
+description = "云平台自动化维护中心 V1"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic==1.16.5",
+  "argon2-cffi==25.1.0",
+  "cryptography==45.0.7",
+  "fastapi==0.116.1",
+  "httpx==0.28.1",
+  "python-multipart==0.0.20",
+  "PyYAML==6.0.2",
+  "SQLAlchemy==2.0.43",
+  "uvicorn[standard]==0.35.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==8.4.2",
+  "pytest-cov==6.2.1",
+]
+
+[project.scripts]
+automation-center = "automation_center.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers --cov=automation_center --cov-report=term-missing --cov-fail-under=85"

@@ -1,0 +1,20 @@
+.venv/
+.artifact_work/
+outputs/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+backend/.test-data/
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+*.tsbuildinfo
+.env
+certs/*.key
+data/
+.build/
+/1 自动化中心.md

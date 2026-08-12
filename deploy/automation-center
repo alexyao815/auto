@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+# 容器内运维入口复用应用 CLI，便于在不暴露新 HTTP 接口的情况下重置账号。
+export PYTHONPATH="${PYTHONPATH:-/app/backend/src}"
+exec python -m automation_center.cli "$@"

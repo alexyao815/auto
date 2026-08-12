@@ -1,0 +1,13 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'; import { ElMessage, ElMessageBox } from 'element-plus'; import { api, formatTime } from '../api'
+const packages = ref<any[]>([]); const file = ref<File>(); const uploading = ref(false)
+async function load(){ packages.value = await api('/packages') }
+function choose(event:Event){ file.value=(event.target as HTMLInputElement).files?.[0] }
+async function upload(){ if(!file.value)return; const data=new FormData();data.append('file',file.value);uploading.value=true;try{await api('/packages',{method:'POST',body:data});ElMessage.success('维护包上传成功');file.value=undefined;load()}finally{uploading.value=false} }
+async function updatePackage(row:any,event:Event){const selected=(event.target as HTMLInputElement).files?.[0];if(!selected)return;const data=new FormData();data.append('file',selected);await api(`/packages/${row.id}/bundle`,{method:'PUT',body:data});ElMessage.success('Revision 已更新');load()}
+async function remove(row:any){await ElMessageBox.confirm(`删除维护包 ${row.name}？历史任务快照会保留。`,'删除维护包',{type:'warning'});await api(`/packages/${row.id}`,{method:'DELETE'});load()}
+onMounted(load)
+</script>
+<template><div class="page-head"><div><h1>维护包中心</h1><p>上传经过出包平台验证的 Shell/Python 维护包</p></div></div><div class="panel"><div class="panel-title"><h2>上传维护包</h2><span class="muted">inner-package.tar.gz + inner-package.sha256 · 最大 10 GiB</span></div><input type="file" accept=".gz,.tgz" @change="choose" /><el-button type="primary" :disabled="!file" :loading="uploading" style="margin-left:12px" @click="upload">上传并校验</el-button></div>
+<div class="panel"><div class="panel-title"><h2>当前维护包</h2><router-link to="/tasks/create">创建任务</router-link></div><el-table :data="packages" empty-text="暂无维护包"><el-table-column prop="name" label="Package Name" min-width="210" /><el-table-column label="Revision" width="95"><template #default="s">v{{ s.row.revision }}</template></el-table-column><el-table-column prop="component" label="组件" /><el-table-column prop="bug_id" label="Bug/Defect" /><el-table-column label="目标角色"><template #default="s">{{ s.row.target_roles.join(', ') || '—' }}</template></el-table-column><el-table-column label="更新时间" min-width="170"><template #default="s">{{ formatTime(s.row.updated_at) }}</template></el-table-column><el-table-column label="操作" width="190"><template #default="s"><label class="el-button el-button--primary is-link"><input type="file" hidden @change="updatePackage(s.row,$event)" />更新</label><el-button type="danger" link @click="remove(s.row)">删除</el-button></template></el-table-column></el-table></div></template>
+
