@@ -51,8 +51,7 @@ assert "not permitted" not in text
 check_response 'wheel key.list_all' -d client=wheel -d fun=key.list_all
 check_response 'runner jobs.list_jobs' -d client=runner -d fun=jobs.list_jobs
 check_response 'local test.ping' -d client=local -d tgt="$MINION_ID" -d fun=test.ping
-check_response 'local grains.item' -d client=local -d tgt="$MINION_ID" -d fun=grains.item -d arg=host -d arg=fqdn_ip4
-check_response 'local service.get_all' -d client=local -d tgt="$MINION_ID" -d fun=service.get_all
+check_response 'local grains.item' -d client=local -d tgt="$MINION_ID" -d fun=grains.item -d arg=host -d arg=ipv4
 check_response 'local cmd.run' -d client=local -d tgt="$MINION_ID" -d fun=cmd.run -d arg='/usr/bin/printf automation-center-api-check'
 check_response 'local cmd.run_all' -d client=local -d tgt="$MINION_ID" -d fun=cmd.run_all -d arg='/usr/bin/true'
 

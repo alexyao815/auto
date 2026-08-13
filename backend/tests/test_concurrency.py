@@ -4,11 +4,13 @@ import threading
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from fastapi import HTTPException
 from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 
-from automation_center.models import SessionRecord, Task, TaskAttempt, TaskNode, utcnow
+import automation_center.api as api_module
+from automation_center.models import AuditLog, SessionRecord, Task, TaskAttempt, TaskNode, utcnow
 from automation_center.scheduler import Scheduler
 from automation_center.task_service import cancel_task_node, create_task
 
@@ -31,6 +33,7 @@ def create_waiting(client, auth, package_id, key):
 
 def test_concurrent_idempotent_create_returns_one_task(client, auth, tmp_path):
     client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     package = upload(client, auth, build_bundle(tmp_path, name="concurrent-create"))
     factory = client.app.state.session_factory
     # Barrier 让两个事务越过各自准备阶段后同时写入，稳定触发幂等唯一键竞争。
@@ -40,6 +43,7 @@ def test_concurrent_idempotent_create_returns_one_task(client, auth, tmp_path):
         with factory() as session:
             barrier.wait()
             task, replayed = create_task(session, package["id"], [], ["demo-node"], "same", [], "same-key")
+            session.commit()
             return task.id, replayed
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -102,8 +106,58 @@ def test_successful_login_commits_session_and_audit_once(client):
     assert commits == 1
 
 
+def test_task_creation_and_audit_roll_back_together(client, auth, tmp_path, monkeypatch):
+    client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
+    package = upload(client, auth, build_bundle(tmp_path, name="atomic-create"))
+    original_audit = api_module.audit
+
+    def fail_after_staging_audit(session, request, operation, object_type, object_id, detail=None):
+        original_audit(session, request, operation, object_type, object_id, detail)
+        if operation == "CREATE_TASK":
+            raise RuntimeError("forced create audit failure")
+
+    monkeypatch.setattr(api_module, "audit", fail_after_staging_audit)
+    body = {"package_id": package["id"], "node_ids": ["demo-node"], "role_names": [], "remark": "", "confirmed_warnings": []}
+    with pytest.raises(RuntimeError, match="forced create audit failure"):
+        client.post("/api/v1/tasks", json=body, headers={**auth, "Idempotency-Key": "atomic-create-key"})
+
+    factory = client.app.state.session_factory
+    with factory() as session:
+        assert session.scalar(select(func.count(Task.id)).where(Task.idempotency_key == "atomic-create-key")) == 0
+        assert session.scalar(select(func.count(AuditLog.id)).where(AuditLog.operation == "CREATE_TASK")) == 0
+
+
+def test_task_cancel_aggregation_and_audit_roll_back_together(client, auth, tmp_path, monkeypatch):
+    client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
+    package = upload(client, auth, build_bundle(tmp_path, name="atomic-cancel"))
+    task = create_waiting(client, auth, package["id"], "atomic-cancel-key")
+    original_audit = api_module.audit
+
+    def fail_after_staging_audit(session, request, operation, object_type, object_id, detail=None):
+        original_audit(session, request, operation, object_type, object_id, detail)
+        if operation == "CANCEL_TASK":
+            raise RuntimeError("forced cancel audit failure")
+
+    monkeypatch.setattr(api_module, "audit", fail_after_staging_audit)
+    with pytest.raises(RuntimeError, match="forced cancel audit failure"):
+        client.post(f"/api/v1/tasks/{task['id']}/cancel", headers=auth)
+
+    factory = client.app.state.session_factory
+    with factory() as session:
+        stored_task = session.get(Task, task["id"])
+        stored_node = session.get(TaskNode, task["nodes"][0]["id"])
+        assert stored_task is not None and stored_task.status == "WAITING"
+        assert stored_node is not None and stored_node.status == "WAITING"
+        assert session.scalar(select(func.count(AuditLog.id)).where(
+            AuditLog.operation == "CANCEL_TASK", AuditLog.object_id == task["id"]
+        )) == 0
+
+
 def test_duplicate_scheduler_claim_creates_one_attempt(client, auth, salt, settings, tmp_path):
     client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     package = upload(client, auth, build_bundle(tmp_path, name="concurrent-claim"))
     task = create_waiting(client, auth, package["id"], "claim-key")
     task_node_id = task["nodes"][0]["id"]
@@ -131,6 +185,7 @@ def test_duplicate_scheduler_claim_creates_one_attempt(client, auth, salt, setti
 
 def test_scheduler_cancel_race_has_one_terminal_decision(client, auth, tmp_path):
     client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     package = upload(client, auth, build_bundle(tmp_path, name="cancel-race"))
     task = create_waiting(client, auth, package["id"], "cancel-race-key")
     task_node_id = task["nodes"][0]["id"]

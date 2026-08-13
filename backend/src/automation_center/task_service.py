@@ -115,7 +115,12 @@ def create_task(
     confirmed_warnings: list[str],
     idempotency_key: str,
 ) -> tuple[Task, bool]:
-    """重新执行 Preview 校验并创建任务快照，或返回永久幂等重放。"""
+    """重新校验并创建任务快照，但把最终提交留给 API 编排层。
+
+    为取得 SQLite 写锁，本函数会先提交无业务写入的 Preview 读事务。新 Task
+    只执行 ``flush``，调用方必须在同一事务中写入审计后提交；异常时回滚会同时
+    撤销 Task、TaskNode 和队列计数器变更。
+    """
 
     if not idempotency_key or len(idempotency_key) > 128:
         raise HTTPException(status_code=422, detail="Idempotency-Key 必须存在且不超过 128 字符")
@@ -145,7 +150,8 @@ def create_task(
         if existing:
             if existing.request_hash != request_hash:
                 raise HTTPException(status_code=409, detail="Idempotency-Key 已被不同请求使用")
-            session.commit()
+            # 该分支没有业务写入；释放 BEGIN IMMEDIATE，避免重放请求占用写锁。
+            session.rollback()
             return existing, True
         queue_values = _next_queue_values(session, len(nodes))
         task = Task(
@@ -174,7 +180,8 @@ def create_task(
                 queue_entered_at=utcnow(),
                 queue_seq=queue_seq,
             ))
-        session.commit()
+        # 审计必须与 Task 创建原子提交，Service 不得提前 commit。
+        session.flush()
         return task, False
     except Exception:
         session.rollback()
@@ -182,8 +189,10 @@ def create_task(
 
 
 def aggregate_task(session: Session, task_id: str) -> Task:
-    """依据全部 TaskNode 状态重算 Task 聚合状态和计数。"""
+    """依据全部 TaskNode 状态重算聚合字段，不提交调用方事务。"""
 
+    # autoflush=False，先落下调用方在同一事务内修改的 TaskNode 状态再聚合。
+    session.flush()
     task = session.scalar(select(Task).where(Task.id == task_id).options(selectinload(Task.nodes)))
     if task is None:
         raise HTTPException(status_code=404, detail="Task 不存在")
@@ -217,7 +226,7 @@ def aggregate_task(session: Session, task_id: str) -> Task:
         task.finished_at = task.finished_at or utcnow()
     else:
         task.finished_at = None
-    session.commit()
+    session.flush()
     return task
 
 
@@ -272,6 +281,6 @@ def cancel_task_node(session: Session, task_node: TaskNode) -> TaskNode:
     if changed != 1:
         session.rollback()
         raise HTTPException(status_code=409, detail="TaskNode 已被调度或取消")
-    session.commit()
     aggregate_task(session, task_id)
+    session.commit()
     return session.get(TaskNode, task_node_id)

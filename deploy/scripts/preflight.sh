@@ -121,7 +121,7 @@ else
   fail "Minion 缺少执行依赖、Salt 执行用户不是 root，或既有任务目录不可写"
 fi
 
-minion_ips="$(salt --out=txt "$MINION_ID" grains.get fqdn_ip4 2>/dev/null || true)"
+minion_ips="$(salt --out=txt "$MINION_ID" grains.get ipv4 2>/dev/null || true)"
 if printf '%s\n' "$minion_ips" | grep -Fq "$EXPECTED_MINION_IP"; then
   pass "Minion grains 包含预期地址 $EXPECTED_MINION_IP"
 else

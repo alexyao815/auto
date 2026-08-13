@@ -30,7 +30,7 @@ def test_node_package_task_scheduler_flow(client, auth, salt, tmp_path):
     assert client.post("/api/v1/nodes/refresh", headers=auth).status_code == 200
     nodes = client.get("/api/v1/nodes").json()
     demo_node = next(node for node in nodes if node["id"] == "demo-node")
-    assert demo_node["roles"] == [] or demo_node["roles"] == ["compute"]
+    assert demo_node["roles"] == []
     update = client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     assert update.status_code == 200
     bundle = build_bundle(tmp_path)
@@ -72,6 +72,8 @@ def test_node_package_task_scheduler_flow(client, auth, salt, tmp_path):
 
 
 def test_offline_warning_cancel_and_retry_guard(client, auth, salt, tmp_path):
+    client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     salt._accepted["demo-node"]["offline"] = True
     assert client.post("/api/v1/nodes/refresh", headers=auth).status_code == 200
     bundle = build_bundle(tmp_path, name="offline-fix")

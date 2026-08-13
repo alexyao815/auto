@@ -56,7 +56,7 @@ class TaskCreateRequest(TaskPreviewRequest):
 
 
 class NodeUpdateRequest(BaseModel):
-    """节点启停和人工/自动角色切换请求。"""
+    """节点启停和人工角色请求；restore_auto_roles 仅保留历史兼容性。"""
     enabled: bool | None = None
     roles: list[str] | None = None
     restore_auto_roles: bool = False
@@ -99,7 +99,7 @@ def audit(session: Session, request: Request, operation: str, object_type: str, 
 
 
 def serialize_node(node: Node) -> dict[str, Any]:
-    """序列化节点，并合并人工或自动角色的有效视图。"""
+    """序列化节点，并按历史 source 兼容规则返回有效角色。"""
     return {
         "id": node.id,
         "hostname": node.hostname,
@@ -310,7 +310,7 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
 
     @protected.post("/nodes/pending/{key_id}/accept", dependencies=[Depends(require_csrf)], summary="接受节点 Key")
     def accept_node(key_id: str, request: Request, session: Session = Depends(get_session)):
-        """接受 Minion Key，发现节点属性并执行首次角色识别。"""
+        """接受 Minion Key，并低频读取一次 hostname 与 management IP。"""
         salt.accept_key(key_id)
         snapshot = probe_node(salt, key_id)
         node = next(node for node in apply_node_snapshots(session, [snapshot]) if node.id == key_id)
@@ -345,7 +345,7 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
 
     @protected.patch("/nodes/{node_id}", dependencies=[Depends(require_csrf)], summary="更新节点")
     def update_node(node_id: str, payload: NodeUpdateRequest, request: Request, session: Session = Depends(get_session)):
-        """启停节点，或切换人工角色与自动角色来源。"""
+        """启停节点或设置人工角色；可兼容恢复已有 auto 历史记录。"""
         node = session.scalar(select(Node).where(Node.id == node_id).options(selectinload(Node.roles)))
         if node is None:
             raise HTTPException(status_code=404, detail="Node 不存在")
@@ -441,14 +441,19 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
         session: Session = Depends(get_session),
     ):
         """重新校验预览条件，并用永久 Idempotency-Key 创建或重放 Task。"""
-        task, replayed = create_task(session, payload.package_id, payload.role_names, payload.node_ids, payload.remark, payload.confirmed_warnings, idempotency_key)
-        if replayed:
-            # 同 Key 同请求返回原 Task；不同请求由 Service 以 409 拒绝。
-            response.status_code = 200
-            response.headers["Idempotent-Replayed"] = "true"
-        else:
-            audit(session, request, "CREATE_TASK", "TASK", task.id, {"package_id": payload.package_id, "target_node_count": task.target_node_count})
-            session.commit()
+        try:
+            task, replayed = create_task(session, payload.package_id, payload.role_names, payload.node_ids, payload.remark, payload.confirmed_warnings, idempotency_key)
+            if replayed:
+                # 同 Key 同请求返回原 Task；不同请求由 Service 以 409 拒绝。
+                response.status_code = 200
+                response.headers["Idempotent-Replayed"] = "true"
+            else:
+                # Service 仅 flush；Task、TaskNode、队列号和审计在这里一次提交。
+                audit(session, request, "CREATE_TASK", "TASK", task.id, {"package_id": payload.package_id, "target_node_count": task.target_node_count})
+                session.commit()
+        except Exception:
+            session.rollback()
+            raise
         return serialize_task(task, include_nodes=True)
 
     @protected.get("/tasks", summary="查询任务列表")
@@ -483,11 +488,14 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
         if cancelled == 0:
             session.rollback()
             raise HTTPException(status_code=409, detail="Task 没有可取消的 Waiting 节点")
-        audit(session, request, "CANCEL_TASK", "TASK", task_id, {"cancelled_nodes": cancelled})
-        session.commit()
-        aggregate_task(session, task_id)
-        task = session.scalar(select(Task).where(Task.id == task_id).options(selectinload(Task.nodes)))
-        assert task is not None
+        try:
+            # CAS 结果、Task 聚合字段和审计必须在同一事务中成功或一起回滚。
+            task = aggregate_task(session, task_id)
+            audit(session, request, "CANCEL_TASK", "TASK", task_id, {"cancelled_nodes": cancelled})
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         return serialize_task(task, include_nodes=True)
 
     @protected.post("/tasks/{task_id}/nodes/{task_node_id}/cancel", dependencies=[Depends(require_csrf)], summary="取消单个排队节点")

@@ -23,12 +23,13 @@ def test_fake_adapter_full_contract(settings):
     adapter.accept_key("demo-minion")
     assert "demo-minion" in adapter.accepted_keys()
     assert adapter.ping("demo-minion")
+    assert adapter.ping_many(["demo-minion", "missing"]) == {"demo-minion": True, "missing": False}
     assert adapter.node_info("demo-minion")["hostname"] == "demo-minion"
     adapter.transfer_package("demo-minion", "salt://x", "/tmp/x")
     adapter.prepare_workdir("demo-minion", "/tmp/x", "/tmp/work")
     jid = adapter.start_step("demo-minion", "shell", "scripts/fix.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
     assert adapter.job_result(jid, "demo-minion").state == "RUNNING"
-    time.sleep(0.06)
+    time.sleep(0.1)
     assert adapter.job_result(jid, "demo-minion").state == "SUCCESS"
     data, offset = adapter.read_file("demo-minion", "/tmp/o", 0)
     assert data and offset == len(data)
@@ -44,6 +45,7 @@ def test_http_adapter_contract(monkeypatch, settings):
     settings.salt_mode = "http"; settings.salt_api_credential = "pw"
     job_mode = {"value": "success"}
     submitted = {"command": ""}
+    local_calls = []
     def post(url, data=None, headers=None, timeout=None):
         if url.endswith('/login'):
             return Response({"return": [{"token": "token", "expire": time.time()+600}]})
@@ -58,10 +60,12 @@ def test_http_adapter_contract(monkeypatch, settings):
         if client == "local_async":
             submitted["command"] = str(data.get("arg"))
             return Response({"return": [{"jid": "202601010000"}]})
-        if fun == "test.ping": value = True
-        elif fun == "grains.item": value = {"host": "node1", "fqdn_ip4": ["192.0.2.1"]}
-        elif fun == "cmd.run" and data.get("arg") == ["ps -eo comm="]: value = "nova-compute\n"
-        elif fun == "service.get_all": value = ["nova-compute.service"]
+        local_calls.append((target, fun, data.get("arg"), data.get("tgt_type"), data.get("timeout")))
+        if fun == "test.ping" and data.get("tgt_type") == "list":
+            values = {node_id: (True if node_id == "node1" else "Minion did not return. [No response]") for node_id in target.split(",")}
+            return Response({"return": [values]})
+        if fun == "test.ping": value = True if target == "node1" else "Minion did not return. [No response]"
+        elif fun == "grains.item": value = {"host": "node1", "ipv4": ["127.0.0.1", "192.0.2.1"]}
         elif fun == "cmd.run": value = base64.b64encode(b"log").decode()
         elif fun == "cp.get_file": value = "/tmp/package"
         elif fun == "cmd.run_all": value = {"retcode": 0, "stdout": "", "stderr": ""}
@@ -73,18 +77,31 @@ def test_http_adapter_contract(monkeypatch, settings):
     assert adapter.pending_keys() == ["pending"] and adapter.accepted_keys() == ["node1"]
     adapter.accept_key("pending"); adapter.reject_key("pending")
     assert adapter.ping("node1")
+    assert not adapter.ping("dead")
+    assert adapter.ping_many(["node1", "dead"]) == {"node1": True, "dead": False}
+    batch_call = next(call for call in local_calls if call[3] == "list")
+    assert batch_call[4] == 5
+    details_start = len(local_calls)
     assert adapter.node_info("node1")["management_ip"] == "192.0.2.1"
-    assert adapter.node_info("node1")["services"] == ["nova-compute.service"]
+    assert local_calls[details_start:] == [("node1", "grains.item", ["host", "ipv4"], None, None)]
     adapter.transfer_package("node1", "salt://x", "/tmp/x")
     adapter.prepare_workdir("node1", "/tmp/x", "/tmp/work")
     jid = adapter.start_step("node1", "shell", "x.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
     assert jid == "202601010000"
+    assert jid in adapter._submitted_at
     assert "mkdir -p /tmp" in submitted["command"]
     assert adapter.job_result(jid, "node1").state == "SUCCESS"
+    assert jid not in adapter._submitted_at
+    adapter._submitted_at["expired-jid"] = time.monotonic() - 11
+    jid = adapter.start_step("node1", "shell", "x.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
+    assert "expired-jid" not in adapter._submitted_at
     job_mode["value"] = "running"; assert adapter.job_result(jid, "node1").state == "RUNNING"
     job_mode["value"] = "lost"; assert adapter.job_result(jid, "node1").state == "LOST"
+    assert jid not in adapter._submitted_at
     job_mode["value"] = "scalar"; assert adapter.job_result(jid, "node1").stdout == "ok"
     data, offset = adapter.read_file("node1", "/tmp/o", 0); assert data == b"log" and offset == 3
+    jid = adapter.start_step("node1", "shell", "x.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
     assert adapter.terminate_job("node1", jid) == "True"
+    assert jid not in adapter._submitted_at
     adapter.cleanup_workdir("node1", "/tmp/work")
     assert isinstance(create_salt_adapter(settings), HttpSaltAdapter)

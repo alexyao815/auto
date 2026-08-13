@@ -44,6 +44,7 @@ def test_node_manual_roles_restore_disable_and_delete(client, auth):
 
 def test_package_update_active_lock_and_delete(client, auth, tmp_path):
     client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     first = upload(client, auth, build_bundle(tmp_path, name="lifecycle"))
     assert first.status_code == 201
     package = first.json()
@@ -74,6 +75,7 @@ def test_package_update_active_lock_and_delete(client, auth, tmp_path):
 
 def test_task_cancel_node_copy_and_missing_routes(client, auth, tmp_path):
     client.post("/api/v1/nodes/refresh", headers=auth)
+    client.patch("/api/v1/nodes/demo-node", json={"roles": ["compute"]}, headers=auth)
     package = upload(client, auth, build_bundle(tmp_path, name="task-actions")).json()
     body = {"package_id": package["id"], "node_ids": ["demo-node"], "role_names": [], "remark": "copy me", "confirmed_warnings": []}
     task = client.post("/api/v1/tasks", json=body, headers={**auth, "Idempotency-Key": "actions"}).json()
@@ -90,7 +92,7 @@ def test_task_cancel_node_copy_and_missing_routes(client, auth, tmp_path):
     assert client.get("/api/v1/tasks/missing/copy-template").status_code == 404
 
 
-def test_settings_role_rules_health_and_audit_limit(client, auth, salt):
+def test_periodic_probe_keeps_roles_manual_and_settings_audit_limit(client, auth, salt):
     assert client.get("/api/v1/health/ready").status_code == 200
     rules = [{"role": "storage", "matcher_type": "service", "pattern": "storage-daemon", "enabled": True}]
     changed = client.patch("/api/v1/settings", json={"role_detection_rules": rules, "node_status_check_interval": 5}, headers=auth)
@@ -99,6 +101,10 @@ def test_settings_role_rules_health_and_audit_limit(client, auth, salt):
     salt._accepted["demo-node"]["services"] = ["storage-daemon"]
     refreshed = client.post("/api/v1/nodes/refresh", headers=auth)
     assert refreshed.status_code == 200
+    assert next(node for node in refreshed.json() if node["id"] == "demo-node")["roles"] == []
+    manual = client.patch("/api/v1/nodes/demo-node", json={"roles": ["storage"]}, headers=auth)
+    assert manual.json()["roles"] == ["storage"]
+    refreshed = client.post("/api/v1/nodes/refresh", headers=auth)
     assert next(node for node in refreshed.json() if node["id"] == "demo-node")["roles"] == ["storage"]
     bad = client.patch("/api/v1/settings", json={"role_detection_rules": [{"role": "x", "matcher_type": "bad", "pattern": "p"}]}, headers=auth)
     assert bad.status_code == 422

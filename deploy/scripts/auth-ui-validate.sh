@@ -69,10 +69,16 @@ for endpoint in dashboard/summary dashboard/recent-tasks nodes packages tasks se
   echo "PASS endpoint=$endpoint seconds=$seconds"
 done
 
-refresh_status="$(curl -kfsS --max-time 310 -o "$validation_dir/nodes-refresh.json" -b "$cookie_jar" \
-  -w '%{http_code}' -X POST -H "X-CSRF-Token: $csrf_token" "$APP_URL/api/v1/nodes/refresh")"
+refresh_metric="$(curl -kfsS --max-time 10 -o "$validation_dir/nodes-refresh.json" -b "$cookie_jar" \
+  -w '%{http_code} %{time_total}' -X POST -H "X-CSRF-Token: $csrf_token" "$APP_URL/api/v1/nodes/refresh")"
+refresh_status="${refresh_metric%% *}"
+refresh_seconds="${refresh_metric#* }"
 [ "$refresh_status" = 200 ] || { echo "FAIL nodes_refresh HTTP=$refresh_status" >&2; exit 1; }
-echo 'PASS nodes_refresh'
+awk -v value="$refresh_seconds" 'BEGIN { exit !(value < 10.0) }' || {
+  echo "FAIL nodes_refresh_seconds=$refresh_seconds expected_lt=10.0" >&2
+  exit 1
+}
+echo "PASS nodes_refresh seconds=$refresh_seconds"
 
 curl -kfsS --max-time 5 -o /dev/null -b "$cookie_jar" -X POST \
   -H "X-CSRF-Token: $csrf_token" "$APP_URL/api/v1/auth/logout"

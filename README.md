@@ -7,7 +7,7 @@ V1 面向不超过 30 台节点、单管理员和固定单批次维护场景。�
 ## 核心能力
 
 - Salt Minion Key 接受、拒绝、节点发现和在线状态刷新。
-- 根据进程或服务自动识别节点角色，并支持人工修正。
+- 批量探测 Minion 在线状态，并由运维人员人工设置节点角色。
 - 流式上传、SHA-256 校验和安全解压维护包。
 - 按角色和直接节点选择目标，取并集后按 Node ID 去重。
 - 不同节点并发、同一节点 FIFO、单节点内 Step 串行执行。
@@ -84,12 +84,14 @@ SQLite 是任务状态的事实来源，`TaskNode` 是调度单位。内置 Sche
 生产执行需要已部署并互通的 Salt Master、salt-api 和 Salt Minion。仓库不锁定 Salt 软件版本，目标环境必须验证以下能力：
 
 - netapi client：`local`、`local_async`、`runner`、`wheel`。
-- Minion function：`test.ping`、`grains.item`、`service.get_all`、`cmd.run`、`cmd.run_all`、`cp.get_file`、`saltutil.kill_job`。
+- Minion function：`test.ping`、`grains.item`、`cmd.run`、`cmd.run_all`、`cp.get_file`、`saltutil.kill_job`。周期在线探测只执行一次批量 `test.ping`；`grains.item host ipv4` 仅在首次接受 Key 时采集节点资料。
 - Job 查询：`jobs.lookup_jid`、`jobs.list_jobs`。
 - Key 管理：`key.list_all`、`key.accept`、`key.reject`。
 - Salt Fileserver 能读取 `/var/lib/automation-center/packages`。
 
 Minion 还必须提供 `/bin/bash`、`/usr/bin/python3` 和 `tar`，并允许 Salt 执行用户创建和清理 `/var/lib/automation-center/tasks/` 下的任务工作目录。最小权限模板见 [`deploy/salt/master.d/automation-center.conf`](deploy/salt/master.d/automation-center.conf)。
+
+节点角色由运维人员在页面人工设置。系统不会在周期探测中执行 `ps` 或枚举服务来猜测角色。
 
 ### 生产部署环境
 

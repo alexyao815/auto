@@ -109,7 +109,7 @@ npm run dev
 
 ### 3.6 从页面完成任务
 
-1. 进入“节点中心”，点击“立即探测”。Fake Salt 内置的 `demo-node` 会以 Online 节点出现，并自动识别为 `compute`。
+1. 进入“节点中心”，点击“立即探测”。Fake Salt 内置的 `demo-node` 会以 Online 节点出现；点击“角色”并人工设置为 `compute`。
 2. 进入“维护包中心”，上传刚生成的外层包。
 3. 进入“创建维护任务”，选择演示包和 `demo-node`，生成确认快照并创建任务。
 4. 进入任务详情，观察 Task、TaskNode、Attempt 和两个 Step 的结果与日志。

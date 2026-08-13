@@ -15,6 +15,10 @@ import httpx
 from .config import Settings
 
 
+NODE_PROBE_TIMEOUT_SECONDS = 5
+JOB_SUBMISSION_GRACE_SECONDS = 10
+
+
 @dataclass(slots=True)
 class SaltJobResult:
     """统一不同 Salt 返回形态后的异步 Job 状态。"""
@@ -36,6 +40,7 @@ class SaltAdapter(Protocol):
     def reject_key(self, key_id: str) -> None: ...
     def accepted_keys(self) -> list[str]: ...
     def ping(self, node_id: str) -> bool: ...
+    def ping_many(self, node_ids: list[str]) -> dict[str, bool]: ...
     def node_info(self, node_id: str) -> dict[str, Any]: ...
     def transfer_package(self, node_id: str, salt_source: str, target_path: str) -> None: ...
     def prepare_workdir(self, node_id: str, archive_path: str, workdir: str) -> None: ...
@@ -91,6 +96,10 @@ class FakeSaltAdapter:
     def ping(self, node_id: str) -> bool:
         """根据 accepted 和 offline 标记模拟 test.ping。"""
         return node_id in self._accepted and not self._accepted[node_id].get("offline", False)
+
+    def ping_many(self, node_ids: list[str]) -> dict[str, bool]:
+        """一次返回多个 Fake Minion 的在线状态，模拟真实 Salt 批量 targeting。"""
+        return {node_id: self.ping(node_id) for node_id in node_ids}
 
     def node_info(self, node_id: str) -> dict[str, Any]:
         """返回 Fake 节点属性的副本，避免调用方修改内部状态。"""
@@ -190,6 +199,42 @@ class HttpSaltAdapter:
         self._token = ""
         self._token_expire = 0.0
         self._submitted_at: dict[str, float] = {}
+        self._submission_lock = threading.Lock()
+
+    def _remember_submission(self, jid: str) -> None:
+        """记录新 JID，并清除已超出 job-cache 宽限期的历史记录。
+
+        该内存映射仅用于覆盖 Salt Job 刚提交但尚未进入 job cache 的短窗口，
+        不是 Job 历史存储。每次提交都会淘汰超过十秒的条目，使占用量受近期
+        提交速率约束，不会随服务运行天数增长。
+        """
+
+        now = time.monotonic()
+        cutoff = now - JOB_SUBMISSION_GRACE_SECONDS
+        with self._submission_lock:
+            expired = [known_jid for known_jid, submitted_at in self._submitted_at.items() if submitted_at <= cutoff]
+            for known_jid in expired:
+                self._submitted_at.pop(known_jid, None)
+            self._submitted_at[jid] = now
+
+    def _submission_is_in_grace(self, jid: str) -> bool:
+        """判断 JID 是否仍在短暂可见性宽限期，并顺手淘汰过期记录。"""
+
+        now = time.monotonic()
+        with self._submission_lock:
+            submitted_at = self._submitted_at.get(jid)
+            if submitted_at is None:
+                return False
+            if now - submitted_at < JOB_SUBMISSION_GRACE_SECONDS:
+                return True
+            self._submitted_at.pop(jid, None)
+            return False
+
+    def _forget_submission(self, jid: str) -> None:
+        """Job 已进入终态或被终止后立即释放临时提交时间。"""
+
+        with self._submission_lock:
+            self._submitted_at.pop(jid, None)
 
     def _login(self) -> None:
         """使用外部认证登录并在真实到期时间前 30 秒刷新 Token。"""
@@ -259,20 +304,43 @@ class HttpSaltAdapter:
         return sorted(data.get("minions", []))
 
     def ping(self, node_id: str) -> bool:
-        """调用 test.ping 判断 Minion 当前是否可达。"""
-        return bool(self._local(node_id, "test.ping"))
+        """复用批量探测契约，单节点接入同样受五秒截止时间保护。"""
+        return self.ping_many([node_id]).get(node_id, False)
+
+    def ping_many(self, node_ids: list[str]) -> dict[str, bool]:
+        """用一次 list targeting 探测多个 Minion，并严格过滤错误字符串。
+
+        Salt 对失联 Key 会返回 ``Minion did not return`` 字符串。该字符串非空，
+        不能使用 ``bool(value)`` 判断，否则会把 Offline 节点误报为 ONLINE。
+        五秒 publish timeout 是在线探测的独立硬上限，不影响任务执行超时。
+        """
+
+        if not node_ids:
+            return {}
+        result = self._request({
+            "client": "local",
+            "tgt": ",".join(node_ids),
+            "tgt_type": "list",
+            "fun": "test.ping",
+            "timeout": NODE_PROBE_TIMEOUT_SECONDS,
+        })
+        values = result if isinstance(result, dict) else {}
+        return {node_id: values.get(node_id) is True for node_id in node_ids}
 
     def node_info(self, node_id: str) -> dict[str, Any]:
-        """聚合 grains、进程和服务信息，供节点发现及角色识别使用。"""
-        grains = self._local(node_id, "grains.item", ["host", "fqdn_ip4"]) or {}
-        processes = self._local(node_id, "cmd.run", ["ps -eo comm="]) or ""
-        services = self._local(node_id, "service.get_all") or []
-        ips = grains.get("fqdn_ip4") or []
+        """首次接入时低频读取 hostname 和 IPv4，不扫描进程或服务。"""
+
+        grains = self._local(node_id, "grains.item", ["host", "ipv4"])
+        if not isinstance(grains, dict):
+            raise RuntimeError("InvalidGrainsResponse")
+        ips = grains.get("ipv4") or []
+        management_ip = next(
+            (str(ip) for ip in ips if isinstance(ip, str) and not ip.startswith("127.")),
+            None,
+        )
         return {
             "hostname": grains.get("host", node_id),
-            "management_ip": ips[0] if ips else None,
-            "processes": processes.splitlines(),
-            "services": list(services) if isinstance(services, list) else [],
+            "management_ip": management_ip,
         }
 
     def transfer_package(self, node_id: str, salt_source: str, target_path: str) -> None:
@@ -307,7 +375,7 @@ class HttpSaltAdapter:
         if not jid:
             raise RuntimeError("SaltJobSubmitFailed")
         jid = str(jid)
-        self._submitted_at[jid] = time.monotonic()
+        self._remember_submission(jid)
         return jid
 
     def job_result(self, jid: str, node_id: str) -> SaltJobResult:
@@ -317,12 +385,16 @@ class HttpSaltAdapter:
             jobs = self._request({"client": "runner", "fun": "jobs.list_jobs"}) or {}
             # 刚提交的 Job 可能尚未出现在 job cache，10 秒宽限可避免误判；重启后没有
             # 内存提交时间，只能依据持久化 JID 和 Salt job 列表保守判断。
-            if jid in jobs or time.monotonic() - self._submitted_at.get(jid, float("-inf")) < 10:
+            in_submission_grace = self._submission_is_in_grace(jid)
+            if jid in jobs or in_submission_grace:
                 return SaltJobResult(state="RUNNING")
+            self._forget_submission(jid)
             return SaltJobResult(state="LOST", failure_reason="EXECUTION_STATE_LOST")
         node_result = result.get(node_id)
         if node_result is None:
+            self._forget_submission(jid)
             return SaltJobResult(state="LOST", failure_reason="EXECUTION_STATE_LOST")
+        self._forget_submission(jid)
         if isinstance(node_result, dict):
             code = int(node_result.get("retcode", 1))
             return SaltJobResult(state="SUCCESS" if code == 0 else "FAILED", exit_code=code, stdout=str(node_result.get("stdout", "")), stderr=str(node_result.get("stderr", "")))
@@ -339,8 +411,12 @@ class HttpSaltAdapter:
 
     def terminate_job(self, node_id: str, jid: str) -> str:
         """请求 Minion 尽力终止超时 Job，返回文本只作为警告证据。"""
-        result = self._local(node_id, "saltutil.kill_job", [jid])
-        return str(result)
+        try:
+            result = self._local(node_id, "saltutil.kill_job", [jid])
+            return str(result)
+        finally:
+            # Scheduler 在超时后不再轮询该 JID，因此无论终止请求是否成功都要清理。
+            self._forget_submission(jid)
 
     def cleanup_workdir(self, node_id: str, workdir: str) -> None:
         """删除远端 Attempt 工作目录；失败由 Scheduler 记录并稍后重试。"""

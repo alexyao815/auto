@@ -59,7 +59,7 @@ class Node(Base):
 
 
 class NodeRole(Base):
-    """节点角色及来源；auto 与 manual 分开保存以支持恢复自动识别。"""
+    """节点角色及来源；保留 source 字段兼容历史 auto 数据，当前使用 manual。"""
 
     __tablename__ = "node_roles"
     __table_args__ = (UniqueConstraint("node_id", "role", "source", name="uq_node_role_source"),)

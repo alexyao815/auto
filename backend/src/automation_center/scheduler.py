@@ -38,6 +38,10 @@ from .task_service import aggregate_task
 logger = logging.getLogger(__name__)
 
 
+class _SchedulerStopping(Exception):
+    """应用关闭时停止本地监控，但保留已持久化 JID 供下次启动恢复。"""
+
+
 class Scheduler:
     """在单应用进程内驱动持久化任务状态机。
 
@@ -52,6 +56,7 @@ class Scheduler:
         self.salt = salt
         self.executor = ThreadPoolExecutor(max_workers=settings.scheduler_max_workers, thread_name_prefix="task-node")
         self._stop = asyncio.Event()
+        self._thread_stop = threading.Event()
         self._running: set[str] = set()
         self._guard = threading.Lock()
 
@@ -76,11 +81,14 @@ class Scheduler:
         marker = getattr(self, "_last_node_refresh", 0.0)
         if time.monotonic() - marker < self.settings.node_status_check_interval:
             return
-        self._last_node_refresh = time.monotonic()
-        await asyncio.to_thread(self._refresh_nodes_sync)
+        try:
+            await asyncio.to_thread(self._refresh_nodes_sync)
+        finally:
+            # 从一轮完成时重新计时；慢探测或异常不能触发无间隔连续重试。
+            self._last_node_refresh = time.monotonic()
 
     def _refresh_nodes_sync(self) -> None:
-        """先在事务外探测 Salt，再用单个短事务更新节点和自动角色。"""
+        """先在事务外批量 ping Salt，再用单个短事务更新节点状态。"""
 
         with self.factory() as session:
             known_ids = set(session.scalars(select(Node.id)))
@@ -90,26 +98,70 @@ class Scheduler:
             session.commit()
 
     async def stop(self) -> None:
-        """请求循环停止；已开始的节点执行不被强制取消。"""
+        """停止调度并等待工作线程退出，已持久化 JID 留给重启恢复。
+
+        Python 不能强制取消正在运行的线程。这里通过线程事件让监控循环主动退出，
+        再在线程外执行 ``shutdown(wait=True)``；既不阻塞 FastAPI 事件循环，也不会
+        把已 Claim 但尚未开始的任务留成无 JID 的 RUNNING 状态。
+        """
+
         self._stop.set()
-        self.executor.shutdown(wait=False, cancel_futures=False)
+        self._thread_stop.set()
+        await asyncio.to_thread(self.executor.shutdown, wait=True)
 
     async def tick(self) -> None:
         """按全局 queue_seq 扫描 Waiting 节点并尝试并发 Claim。"""
+
+        if self._stop.is_set():
+            return
         with self.factory() as session:
             waiting = list(session.scalars(
                 select(TaskNode).where(TaskNode.status == "WAITING").order_by(TaskNode.queue_seq).limit(100)
             ))
         for task_node in waiting:
+            if self._stop.is_set():
+                break
             with self._guard:
                 # 这是进程内去重优化，服务重启或竞争 Worker 仍依赖数据库约束。
                 if task_node.id in self._running:
                     continue
             claimed = await asyncio.to_thread(self._claim, task_node.id)
             if claimed:
+                if self._stop.is_set():
+                    # stop 可能在 Claim 的数据库线程执行期间到达；尚未提交到执行池时
+                    # 可以安全删除空 Attempt、释放节点锁并保持原 FIFO 位置。
+                    await asyncio.to_thread(self._release_unstarted_claim, task_node.id)
+                    break
                 with self._guard:
                     self._running.add(task_node.id)
                 asyncio.get_running_loop().run_in_executor(self.executor, self._execute_claimed, task_node.id)
+
+    def _release_unstarted_claim(self, task_node_id: str) -> bool:
+        """把尚未发生任何 Salt 下发的 Claim 原子退回 Waiting。"""
+
+        with self.factory() as session:
+            task_node = session.scalar(
+                select(TaskNode).where(TaskNode.id == task_node_id).options(
+                    selectinload(TaskNode.task).selectinload(Task.nodes),
+                    selectinload(TaskNode.attempts).selectinload(TaskAttempt.steps),
+                )
+            )
+            if task_node is None or task_node.status != "RUNNING" or not task_node.attempts:
+                return False
+            attempt = task_node.attempts[-1]
+            if any(step.status != "WAITING" or step.salt_jid is not None for step in attempt.steps):
+                return False
+            session.execute(delete(NodeExecutionLock).where(NodeExecutionLock.task_node_id == task_node.id))
+            session.delete(attempt)
+            task_node.status = "WAITING"
+            task_node.started_at = None
+            task_node.finished_at = None
+            task_node.failure_reason = None
+            task = aggregate_task(session, task_node.task_id)
+            if task.status == "WAITING" and not any(node.started_at for node in task.nodes):
+                task.started_at = None
+            session.commit()
+            return True
 
     def _claim(self, task_node_id: str) -> bool:
         """以 CAS 和唯一节点锁 Claim 一个 Waiting 节点。
@@ -186,13 +238,18 @@ class Scheduler:
         task_node.failure_reason = reason
         task_node.finished_at = utcnow()
         task_id = task_node.task_id
-        session.commit()
         aggregate_task(session, task_id)
+        session.commit()
 
     def _execute_claimed(self, task_node_id: str) -> None:
         """执行已 Claim 节点，并保证释放进程内去重标记。"""
         try:
+            if self._thread_stop.is_set():
+                self._release_unstarted_claim(task_node_id)
+                return
             self._execute(task_node_id)
+        except _SchedulerStopping:
+            logger.info("Scheduler 关闭，TaskNode 留待下次启动恢复 task_node_id=%s", task_node_id)
         finally:
             with self._guard:
                 self._running.discard(task_node_id)
@@ -211,6 +268,8 @@ class Scheduler:
             task = task_node.task
             package = session.get(Package, task.package_id) if task.package_id else None
             attempt = task_node.attempts[-1]
+            if self._thread_stop.is_set() and self._release_unstarted_claim(task_node_id):
+                return
             if package is None:
                 self._finish_node(session, task_node, attempt, "FAILED", "PACKAGE_UNAVAILABLE")
                 return
@@ -292,12 +351,16 @@ class Scheduler:
         stdout_offset = 0
         stderr_offset = 0
         while True:
+            if self._thread_stop.is_set():
+                # JID 已在上方提交；退出本地监控不会终止远端命令，重启后按 JID 恢复。
+                raise _SchedulerStopping
             try:
                 stdout_offset = self._collect_log(node_id, stdout_remote, stdout_local, stdout_offset)
                 stderr_offset = self._collect_log(node_id, stderr_remote, stderr_local, stderr_offset)
                 result = self.salt.job_result(jid, node_id)
             except Exception:
-                time.sleep(1)
+                if self._thread_stop.wait(1):
+                    raise _SchedulerStopping
                 if time.monotonic() - started <= step.timeout_snapshot:
                     continue
                 result = None
@@ -320,7 +383,8 @@ class Scheduler:
                 step.finished_at = utcnow()
                 session.commit()
                 return "FAILED"
-            time.sleep(1)
+            if self._thread_stop.wait(1):
+                raise _SchedulerStopping
 
     def _collect_log(self, node_id: str, remote: str, local: Path, offset: int) -> int:
         """从远端 offset 追加新字节到本地日志，返回下次采集起点。"""
@@ -339,14 +403,16 @@ class Scheduler:
         task_node.finished_at = utcnow()
         session.execute(delete(NodeExecutionLock).where(NodeExecutionLock.task_node_id == task_node.id))
         task_id = task_node.task_id
-        session.commit()
         aggregate_task(session, task_id)
+        session.commit()
 
     async def recover(self) -> None:
         """为数据库中所有 RUNNING TaskNode 启动恢复监控线程。"""
         with self.factory() as session:
             running = list(session.scalars(select(TaskNode).where(TaskNode.status == "RUNNING")))
         for task_node in running:
+            if self._stop.is_set():
+                break
             with self._guard:
                 self._running.add(task_node.id)
             asyncio.get_running_loop().run_in_executor(self.executor, self._recover_node, task_node.id)
@@ -363,6 +429,8 @@ class Scheduler:
                 )
                 if task_node is None or not task_node.attempts:
                     return
+                if self._thread_stop.is_set():
+                    raise _SchedulerStopping
                 attempt = task_node.attempts[-1]
                 running_step = next((step for step in attempt.steps if step.status == "RUNNING"), None)
                 if running_step is None or running_step.salt_jid is None or task_node.node_id is None:
@@ -405,6 +473,8 @@ class Scheduler:
                     attempt.warning_message = "; ".join(warning_messages)
                     task_node.has_warning = True
                 self._finish_node(session, task_node, attempt, "SUCCESS", None)
+        except _SchedulerStopping:
+            logger.info("Scheduler 关闭，恢复监控交回下次启动 task_node_id=%s", task_node_id)
         finally:
             with self._guard:
                 self._running.discard(task_node_id)
@@ -424,6 +494,8 @@ class Scheduler:
         elapsed = max(0.0, (utcnow() - (step.started_at or utcnow())).total_seconds())
         started = time.monotonic() - elapsed
         while True:
+            if self._thread_stop.is_set():
+                raise _SchedulerStopping
             try:
                 stdout_offset = self._collect_log(node_id, stdout_remote, stdout_local, stdout_offset)
                 stderr_offset = self._collect_log(node_id, stderr_remote, stderr_local, stderr_offset)
@@ -455,7 +527,8 @@ class Scheduler:
                 step.finished_at = utcnow()
                 session.commit()
                 return "FAILED"
-            time.sleep(1)
+            if self._thread_stop.wait(1):
+                raise _SchedulerStopping
 
     async def cleanup_expired(self) -> None:
         """每小时清理过期执行日志，并为失败 Attempt 回收远端工作目录。"""
@@ -463,6 +536,7 @@ class Scheduler:
         if time.monotonic() - marker < 3600:
             return
         self._last_cleanup = time.monotonic()
+        local_targets: list[Path] = []
         remote_targets: list[tuple[str, str]] = []
         with self.factory() as session:
             setting = session.get(SystemSetting, "execution_log_retention_days")
@@ -471,7 +545,7 @@ class Scheduler:
             expired = list(session.scalars(select(Task).where(Task.finished_at.is_not(None), Task.finished_at < cutoff)))
             for task in expired:
                 # 仅删除文件日志；Task、Attempt 和 StepResult 等结构化历史长期保留。
-                shutil.rmtree(self.settings.log_dir / task.id, ignore_errors=True)
+                local_targets.append(self.settings.log_dir / task.id)
             failed_cutoff = utcnow() - timedelta(days=self.settings.failed_work_retention_days)
             failed_nodes = session.scalars(
                 select(TaskNode).where(
@@ -484,8 +558,18 @@ class Scheduler:
             for node in failed_nodes:
                 for attempt in node.attempts:
                     remote_targets.append((node.node_id, f"/var/lib/automation-center/tasks/{node.task_id}/attempt-{attempt.attempt_no}"))
+        if local_targets:
+            # 大日志目录可能包含大量文件，必须在线程中删除，不能阻塞 FastAPI 事件循环。
+            await asyncio.to_thread(self._cleanup_log_dirs, local_targets)
         if remote_targets:
             await asyncio.to_thread(self._cleanup_remote_workdirs, remote_targets)
+
+    @staticmethod
+    def _cleanup_log_dirs(targets: list[Path]) -> None:
+        """在工作线程逐个删除过期本地日志目录。"""
+
+        for target in targets:
+            shutil.rmtree(target, ignore_errors=True)
 
     def _cleanup_remote_workdirs(self, targets: list[tuple[str, str]]) -> None:
         """逐个尽力清理远端目录，离线节点留待下一轮保留期扫描。"""

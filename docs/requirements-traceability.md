@@ -4,7 +4,7 @@
 |---|---|---|
 | 固定账号、Session、CSRF | `security.py`、认证 API、Nginx 安全头 | `test_auth_session_and_csrf` |
 | Pending Key 与节点状态 | Salt Adapter、Nodes API、后台探测 | `test_node_package_task_scheduler_flow` |
-| Role 自动识别/人工修正 | RoleRule、NodeRole、Nodes API | 节点闭环测试、API 测试 |
+| Role 人工设置 | NodeRole、Nodes API | 节点闭环测试、API 测试 |
 | 维护包 SHA/Manifest | `package_service.py` | `test_package_security.py` |
 | 上传与解压安全 | 流式写盘、成员/路径/大小/数量限制 | 坏摘要、路径穿越、版本和 Executor 测试 |
 | Task 幂等与确认 | Task Preview/Create API、请求 Hash | 重放和 409 冲突测试 |

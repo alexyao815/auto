@@ -30,9 +30,9 @@
 | NODE-01 | 查询 Salt Pending Keys | 只返回待处理 Key | API/A-已通过 |
 | NODE-02 | Accept Pending Key | Salt 接受成功并创建/更新 Node | 集成/A-已通过 |
 | NODE-03 | Reject Pending Key | Salt 拒绝成功，不创建可调度 Node | Adapter/A-已通过；API E-扩展自动化 |
-| NODE-04 | 刷新在线节点 | 更新 last_seen、grains、Online/Offline | 集成/A-已通过 |
-| NODE-05 | 自动角色规则匹配进程/服务信息 | 计算角色并保存来源 | 单元/A-已通过 |
-| NODE-06 | 人工增加/删除角色 | 人工结果覆盖或补充自动结果，可恢复自动识别 | API/A-已通过 |
+| NODE-04 | 刷新在线节点 | 一次批量 `test.ping` 更新 Online/Offline，不读取 grains/进程/服务 | 集成/A-已通过 |
+| NODE-05 | Accept Key 采集基础资料 | 仅首次执行 `grains.item host ipv4`，保存 Hostname/IP | Adapter/A-已通过 |
+| NODE-06 | 人工增加/删除角色 | 保存人工角色；周期探测不得覆盖 | API/A-已通过 |
 | NODE-07 | Disable 节点 | 节点不再进入 Preview/Create 目标集 | API/A-已通过 |
 | NODE-08 | Enable 节点 | 节点重新允许被选择 | API/A-已通过 |
 | NODE-09 | 删除无活动任务的节点 | 删除成功并写审计 | API/A-已通过 |
@@ -150,7 +150,7 @@
 | DEP-07 | 容器重启 | `/var/lib/automation-center` 中 DB、包、日志、工作目录、备份均保留 | CentOS/M-待验收 |
 | DEP-08 | 应用密钥缺失或仍为开发值 | 生产容器拒绝启动 | 容器/M-待验收 |
 | DEP-09 | Salt Fileserver | Package 根目录只读可见，无需复制到 `/srv/salt` | 真实 Salt/M-待验收 |
-| DEP-10 | Salt 最小权限 | 允许所需 local_async/jobs/key/test/cmd/cp/grains/service/process，其他能力拒绝 | 真实 Salt/M-待验收 |
+| DEP-10 | Salt 最小权限 | 允许所需 local_async/jobs/key/test/cmd/cp/grains，其他能力拒绝 | 真实 Salt/M-待验收 |
 | DEP-11 | salt-api 短暂不可用并恢复 | 已下发 JID 恢复监控，未下发任务保持 Waiting | 真实 Salt/M-待验收 |
 | DEP-12 | 10 GiB 上传 | RSS 不随文件大小线性增长，超限立即停止 | CentOS 容量/M-待验收 |
 
