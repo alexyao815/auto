@@ -114,11 +114,11 @@ else
   fail "Minion test.ping 失败"
 fi
 
-remote_check='test -x /bin/bash && test -x /usr/bin/python3 && command -v tar >/dev/null && test "$(id -u)" -eq 0 && { test ! -e /var/lib/automation-center/tasks || test -w /var/lib/automation-center/tasks; }'
+remote_check='test -x /bin/bash && test -x /usr/bin/python3 && command -v tar >/dev/null && command -v ps >/dev/null && test "$(id -u)" -eq 0 && { test ! -e /var/lib/automation-center/tasks || test -w /var/lib/automation-center/tasks; }'
 if salt --out=txt "$MINION_ID" cmd.retcode "$remote_check" python_shell=true 2>/dev/null | grep -Eq ': *0$'; then
-  pass "Minion 具备 bash、python3、tar 和任务目录执行前提"
+  pass "Minion 具备 bash、python3、tar、ps 和任务目录执行前提"
 else
-  fail "Minion 缺少执行依赖、Salt 执行用户不是 root，或既有任务目录不可写"
+  fail "Minion 缺少 bash/python3/tar/ps、Salt 执行用户不是 root，或既有任务目录不可写"
 fi
 
 minion_ips="$(salt --out=txt "$MINION_ID" grains.get ipv4 2>/dev/null || true)"

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from automation_center.salt import FakeSaltAdapter, HttpSaltAdapter, create_salt_adapter
+from automation_center.salt import FakeSaltAdapter, HttpSaltAdapter, PROCESS_SNAPSHOT_COMMAND, create_salt_adapter
 
 
 class Response:
@@ -25,6 +25,9 @@ def test_fake_adapter_full_contract(settings):
     assert adapter.ping("demo-minion")
     assert adapter.ping_many(["demo-minion", "missing"]) == {"demo-minion": True, "missing": False}
     assert adapter.node_info("demo-minion")["hostname"] == "demo-minion"
+    process = adapter.process_snapshot_many(["demo-node", "missing"])
+    assert process["demo-node"].state == "SUCCESS" and "nova-compute" in process["demo-node"].process_text
+    assert process["missing"].state == "FAILED"
     adapter.transfer_package("demo-minion", "salt://x", "/tmp/x")
     adapter.prepare_workdir("demo-minion", "/tmp/x", "/tmp/work")
     jid = adapter.start_step("demo-minion", "shell", "scripts/fix.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
@@ -46,7 +49,9 @@ def test_http_adapter_contract(monkeypatch, settings):
     job_mode = {"value": "success"}
     submitted = {"command": ""}
     local_calls = []
+    request_timeouts = []
     def post(url, data=None, headers=None, timeout=None):
+        request_timeouts.append(timeout)
         if url.endswith('/login'):
             return Response({"return": [{"token": "token", "expire": time.time()+600}]})
         client = data.get("client"); fun = data.get("fun"); target = data.get("tgt", "node1")
@@ -63,6 +68,13 @@ def test_http_adapter_contract(monkeypatch, settings):
         local_calls.append((target, fun, data.get("arg"), data.get("tgt_type"), data.get("timeout")))
         if fun == "test.ping" and data.get("tgt_type") == "list":
             values = {node_id: (True if node_id == "node1" else "Minion did not return. [No response]") for node_id in target.split(",")}
+            return Response({"return": [values]})
+        if fun == "cmd.run_all" and data.get("tgt_type") == "list":
+            values = {
+                node_id: ({"retcode": 0, "stdout": "nova-compute --config /etc/nova.conf", "stderr": ""}
+                          if node_id == "node1" else "Minion did not return. [No response]")
+                for node_id in target.split(",")
+            }
             return Response({"return": [values]})
         if fun == "test.ping": value = True if target == "node1" else "Minion did not return. [No response]"
         elif fun == "grains.item": value = {"host": "node1", "ipv4": ["127.0.0.1", "192.0.2.1"]}
@@ -84,9 +96,16 @@ def test_http_adapter_contract(monkeypatch, settings):
     details_start = len(local_calls)
     assert adapter.node_info("node1")["management_ip"] == "192.0.2.1"
     assert local_calls[details_start:] == [("node1", "grains.item", ["host", "ipv4"], None, None)]
+    scan_start = len(local_calls)
+    snapshots = adapter.process_snapshot_many(["node1", "dead"])
+    assert snapshots["node1"].state == "SUCCESS" and snapshots["dead"].state == "FAILED"
+    assert local_calls[scan_start:] == [
+        ("node1,dead", "cmd.run_all", PROCESS_SNAPSHOT_COMMAND, "list", 15)
+    ]
+    assert 0 < request_timeouts[-1] <= 15
     adapter.transfer_package("node1", "salt://x", "/tmp/x")
     adapter.prepare_workdir("node1", "/tmp/x", "/tmp/work")
-    prepare_command = next(str(call[2]) for call in local_calls if call[1] == "cmd.run_all")
+    prepare_command = next(str(call[2]) for call in local_calls if call[1] == "cmd.run_all" and "tar -xf" in str(call[2]))
     assert "tar -xf /tmp/x" in prepare_command
     assert "tar -xzf" not in prepare_command
     jid = adapter.start_step("node1", "shell", "x.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")

@@ -3,7 +3,8 @@ import { expect, test, type Route } from '@playwright/test'
 const now = '2026-08-11T08:00:00Z'
 const node = {
   id: 'demo-node', hostname: 'demo-node', management_ip: '192.0.2.10',
-  roles: ['compute'], online_status: 'ONLINE', enabled: true, last_check_time: now,
+  roles: ['compute'], role_details: [{ role: 'compute', sources: ['auto'] }],
+  online_status: 'ONLINE', enabled: true, last_check_time: now,
 }
 const pkg = {
   id: 'package-1', name: 'e2e-package', revision: 1, component: 'compute',
@@ -40,6 +41,7 @@ test('operator completes login, node intake, package upload, task creation and r
     if (path === '/dashboard/recent-tasks') return json(route, [])
     if (path === '/nodes/pending' && method === 'GET') return json(route, pending ? [{ id: 'demo-minion' }] : [])
     if (path === '/nodes/pending/demo-minion/accept') { pending = false; return json(route, node) }
+    if (path === '/nodes/role-detection-jobs' && method === 'GET') return json(route, [])
     if (path === '/nodes') return json(route, [node])
     if (path === '/packages' && method === 'GET') return json(route, uploaded ? [pkg] : [])
     if (path === '/packages' && method === 'POST') { uploaded = true; return json(route, pkg, 201) }
@@ -47,7 +49,7 @@ test('operator completes login, node intake, package upload, task creation and r
     if (path === '/tasks' && method === 'POST') return json(route, task, 201)
     if (path === '/tasks' && method === 'GET') return json(route, [task])
     if (path === '/tasks/task-1') return json(route, task)
-    if (path === '/settings') return json(route, { salt_api_url: 'http://127.0.0.1:8000', salt_api_username: 'automation-center', salt_api_credential: '********', salt_request_timeout: 30, default_step_timeout: 1800, execution_log_retention_days: 7, node_status_check_interval: 60, max_upload_size: 10737418240 })
+    if (path === '/settings') return json(route, { salt_api_url: 'http://127.0.0.1:8000', salt_api_username: 'automation-center', salt_api_credential: '********', salt_request_timeout: 30, default_step_timeout: 1800, execution_log_retention_days: 7, node_status_check_interval: 60, max_upload_size: 10737418240, role_detection_rules: [] })
     if (path.startsWith('/audit-logs')) return json(route, [])
     return json(route, { detail: `unmocked ${method} ${path}` }, 404)
   })
@@ -71,6 +73,7 @@ test('operator completes login, node intake, package upload, task creation and r
   await page.getByRole('link', { name: '创建任务' }).click()
   await page.getByText('选择当前 Revision', { exact: true }).click()
   await page.getByText('e2e-package · v1', { exact: true }).click()
+  await page.locator('.el-select').nth(1).click()
   await page.getByText('compute', { exact: true }).click()
   await page.getByRole('button', { name: '生成确认快照' }).click()
   await expect(page.getByText('demo-node', { exact: true })).toBeVisible()

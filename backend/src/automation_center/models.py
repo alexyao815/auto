@@ -59,7 +59,7 @@ class Node(Base):
 
 
 class NodeRole(Base):
-    """节点角色及来源；保留 source 字段兼容历史 auto 数据，当前使用 manual。"""
+    """节点角色及来源；auto 与 manual 共同组成节点当前有效角色。"""
 
     __tablename__ = "node_roles"
     __table_args__ = (UniqueConstraint("node_id", "role", "source", name="uq_node_role_source"),)
@@ -71,7 +71,7 @@ class NodeRole(Base):
 
 
 class RoleRule(Base):
-    """根据进程或服务名称推导业务角色的可配置规则。"""
+    """根据进程命令行推导业务角色的可配置字面匹配规则。"""
 
     __tablename__ = "role_rules"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -79,6 +79,54 @@ class RoleRule(Base):
     matcher_type: Mapped[str] = mapped_column(String(32))
     pattern: Mapped[str] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class RoleDetectionJob(Base):
+    """一次用户触发的角色识别任务，独立于维护任务状态机。
+
+    ``active_slot`` 在 WAITING/RUNNING 时固定为 1，终态清空。数据库唯一约束
+    保证即使两个创建请求并发到达，也只会存在一个活动识别任务。
+    """
+
+    __tablename__ = "role_detection_jobs"
+    __table_args__ = (UniqueConstraint("active_slot", name="uq_role_detection_active_slot"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="WAITING", index=True)
+    active_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rules_snapshot_json: Mapped[str] = mapped_column(Text, default="[]")
+    total_node_count: Mapped[int] = mapped_column(default=0)
+    target_node_count: Mapped[int] = mapped_column(default=0)
+    success_count: Mapped[int] = mapped_column(default=0)
+    failed_count: Mapped[int] = mapped_column(default=0)
+    skipped_count: Mapped[int] = mapped_column(default=0)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    results: Mapped[list[RoleDetectionNodeResult]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="RoleDetectionNodeResult.node_id_snapshot",
+    )
+
+
+class RoleDetectionNodeResult(Base):
+    """角色识别任务的节点快照和结果；节点删除后历史仍可解释。"""
+
+    __tablename__ = "role_detection_node_results"
+    __table_args__ = (UniqueConstraint("job_id", "node_id_snapshot", name="uq_role_detection_job_node"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("role_detection_jobs.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[str | None] = mapped_column(ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True, index=True)
+    node_id_snapshot: Mapped[str] = mapped_column(String(128))
+    hostname_snapshot: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="WAITING", index=True)
+    matched_roles_json: Mapped[str] = mapped_column(Text, default="[]")
+    added_roles_json: Mapped[str] = mapped_column(Text, default="[]")
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    job: Mapped[RoleDetectionJob] = relationship(back_populates="results")
 
 
 class Package(Base):

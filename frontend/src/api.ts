@@ -63,6 +63,7 @@ export function formatTime(value?: string | null) {
 export function statusType(status: string) {
   if (status === 'SUCCESS' || status === 'ONLINE') return 'success'
   if (status === 'FAILED' || status === 'OFFLINE') return 'danger'
+  if (status === 'PARTIAL_FAILED' || status === 'SKIPPED_OFFLINE') return 'warning'
   if (status === 'RUNNING') return 'primary'
   if (status === 'WAITING') return 'warning'
   return 'info'

@@ -48,9 +48,9 @@ def test_effective_roles_and_node_resolution(client):
         enabled.roles.extend([NodeRole(role="compute", source="auto"), NodeRole(role="network", source="manual")])
         disabled = Node(id="disabled", hostname="disabled", online_status="ONLINE", enabled=False)
         session.add_all([enabled, disabled]); session.commit()
-        assert effective_roles(enabled) == ["compute"]
+        assert effective_roles(enabled) == ["compute", "network"]
         enabled.role_override = True
-        assert effective_roles(enabled) == ["network"]
+        assert effective_roles(enabled) == ["compute", "network"]
         selected, warnings = resolve_nodes(session, ["network"], ["enabled"])
         assert [node.id for node in selected] == ["enabled"] and warnings == []
         selected, warnings = resolve_nodes(session, ["network"], ["enabled", "disabled"])

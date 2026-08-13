@@ -32,13 +32,22 @@
 | NODE-03 | Reject Pending Key | Salt 拒绝成功，不创建可调度 Node | Adapter/A-已通过；API E-扩展自动化 |
 | NODE-04 | 刷新在线节点 | 一次批量 `test.ping` 更新 Online/Offline，不读取 grains/进程/服务 | 集成/A-已通过 |
 | NODE-05 | Accept Key 采集基础资料 | 仅首次执行 `grains.item host ipv4`，保存 Hostname/IP | Adapter/A-已通过 |
-| NODE-06 | 人工增加/删除角色 | 保存人工角色；周期探测不得覆盖 | API/A-已通过 |
+| NODE-06 | 人工增加/删除角色 | 自动和人工标签取并集；保留未删除标签来源，新标签标记 manual | API/A-已通过 |
 | NODE-07 | Disable 节点 | 节点不再进入 Preview/Create 目标集 | API/A-已通过 |
 | NODE-08 | Enable 节点 | 节点重新允许被选择 | API/A-已通过 |
-| NODE-09 | 删除无活动任务的节点 | 删除成功并写审计 | API/A-已通过 |
-| NODE-10 | 删除被 Waiting/Running 引用的节点 | 返回 409，节点保留 | API/A-已通过 |
+| NODE-09 | 删除无活动任务的 Offline 节点 | 页面仅对 Offline 节点显示删除入口；删除当前 Node 并写审计，历史任务保留 | API/UI/A-已通过 |
+| NODE-10 | 删除 Online 节点或被 Waiting/Running 引用的 Offline 节点 | 返回 409，节点保留 | API/A-已通过 |
 | NODE-11 | Salt 临时不可用时刷新 | 返回可识别错误，旧节点状态不被错误覆盖 | 集成/E-扩展自动化 |
 | NODE-12 | 真实 Minion Key 接受与发现 | 页面与 API 能发现目标 Minion | 真实 Salt/M-待验收 |
+| NODE-13 | 创建自动角色识别任务 | 快照所有节点和启用规则；ONLINE 含 Disabled 进入目标，Offline 记录跳过 | API/A-已通过 |
+| NODE-14 | 重复创建识别任务 | 同时只允许一个 Waiting/Running 任务，返回 409 和活动任务 ID | API/A-已通过 |
+| NODE-15 | 批量进程扫描 | 单次 list targeting `cmd.run_all`，15 秒超时，不调用 grains/service | Adapter/A-已通过；真实 Salt/M-待验收 |
+| NODE-16 | 自动与人工标签合并 | 自动只补缺失标签、不重复、不删除；人工标签不被扫描覆盖 | Worker/A-已通过 |
+| NODE-17 | 自动标签人工删除后重新扫描 | 进程仍匹配时重新添加 auto 标签 | Worker/A-已通过 |
+| NODE-18 | 节点级部分失败 | 成功节点落库，失败节点记录原因，Job 为 PARTIAL_FAILED | Worker/A-已通过 |
+| NODE-19 | 识别期间应用重启 | RUNNING Job 收敛为 FAILED/EXECUTION_STATE_LOST，不自动重复扫描 | 恢复/A-已通过 |
+| NODE-20 | 角色规则管理 | 仅接受 process 规则；自由标签校验、重复规则和 service 规则被拒绝 | API/UI/A-已通过 |
+| NODE-21 | 进程原文保密 | 原始命令行不写数据库、审计或日志，仅保存匹配和新增角色 | Worker/A-已通过 |
 
 ## 4. 维护包上传、校验与生命周期
 

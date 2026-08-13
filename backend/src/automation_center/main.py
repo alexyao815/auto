@@ -20,6 +20,7 @@ from .api import create_api_router
 from .config import Settings
 from .database import Base, backup_sqlite, create_db_engine, create_session_factory, is_sqlite_locked, run_migrations, session_dependency
 from .models import RoleRule, SystemSetting
+from .role_detection import RoleDetectionWorker
 from .salt import SaltAdapter, create_salt_adapter
 from .scheduler import Scheduler
 from .security import build_auth_dependencies, decrypt_secret, encrypt_secret, ensure_initial_credential
@@ -43,6 +44,7 @@ def seed_defaults(factory, settings: Settings) -> None:
     """
     with factory() as session:
         ensure_initial_credential(session, settings)
+        role_rules_setting_missing = session.get(SystemSetting, "role_detection_rules") is None
         defaults = {
             "salt_api_url": settings.salt_api_url,
             "salt_api_username": settings.salt_api_username,
@@ -60,7 +62,8 @@ def seed_defaults(factory, settings: Settings) -> None:
         for key, value in defaults.items():
             if session.get(SystemSetting, key) is None:
                 session.add(SystemSetting(key=key, value=value, sensitive=key == "salt_api_credential"))
-        if not session.scalar(select(RoleRule).limit(1)):
+        # 保存空规则列表是管理员的有效选择，重启时不能再次灌入默认规则。
+        if role_rules_setting_missing and not session.scalar(select(RoleRule).limit(1)):
             for rule in DEFAULT_ROLE_RULES:
                 session.add(RoleRule(**rule, enabled=True))
         session.commit()
@@ -112,6 +115,7 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
     factory = create_session_factory(engine)
     salt = salt_adapter or create_salt_adapter(settings)
     scheduler = Scheduler(factory, settings, salt)
+    role_detection_worker = RoleDetectionWorker(factory, salt, settings.scheduler_interval_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -126,12 +130,18 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
         load_persisted_settings(factory, settings)
         # 单进程部署让内置 Scheduler 只有一个实例；多 Worker 会破坏这个不变量。
         scheduler_task = asyncio.create_task(scheduler.run()) if settings.enable_scheduler else None
+        role_detection_task = asyncio.create_task(role_detection_worker.run()) if settings.enable_scheduler else None
         try:
             yield
         finally:
             if scheduler_task:
                 await scheduler.stop()
+            if role_detection_task:
+                await role_detection_worker.stop()
+            if scheduler_task:
                 await scheduler_task
+            if role_detection_task:
+                await role_detection_task
             engine.dispose()
 
     app = FastAPI(title="云平台自动化维护中心", version=__version__, lifespan=lifespan)
@@ -140,6 +150,7 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
     app.state.session_factory = factory
     app.state.salt = salt
     app.state.scheduler = scheduler
+    app.state.role_detection_worker = role_detection_worker
     get_session = session_dependency(factory)
     require_session, require_csrf = build_auth_dependencies(settings, get_session)
     app.include_router(create_api_router(settings, get_session, salt, require_session, require_csrf))
@@ -166,9 +177,16 @@ def create_app(settings: Settings | None = None, salt_adapter: SaltAdapter | Non
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         """统一 FastAPI 参数校验错误，避免各端点返回格式不一致。"""
+        details = []
+        for error in exc.errors():
+            serialized = dict(error)
+            if serialized.get("ctx"):
+                # Pydantic 会把 ValueError 对象放入 ctx；响应只能包含可序列化文本。
+                serialized["ctx"] = {key: str(value) for key, value in serialized["ctx"].items()}
+            details.append(serialized)
         return JSONResponse(
             status_code=422,
-            content={"type": "about:blank", "title": "参数校验失败", "status": 422, "detail": exc.errors(), "instance": str(request.url.path)},
+            content={"type": "about:blank", "title": "参数校验失败", "status": 422, "detail": details, "instance": str(request.url.path)},
         )
 
     @app.exception_handler(OperationalError)

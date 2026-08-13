@@ -19,10 +19,9 @@ TERMINAL_NODE_STATUSES = {"SUCCESS", "FAILED", "CANCELLED"}
 
 
 def effective_roles(node: Node) -> list[str]:
-    """返回当前生效角色：人工覆盖开启时只采用 manual，否则采用 auto。"""
+    """返回自动识别与人工维护角色的去重并集。"""
 
-    source = "manual" if node.role_override else "auto"
-    return sorted({role.role for role in node.roles if role.source == source})
+    return sorted({role.role for role in node.roles})
 
 
 def resolve_nodes(session: Session, role_names: list[str], node_ids: list[str]) -> tuple[list[Node], list[dict]]:

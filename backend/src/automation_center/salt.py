@@ -16,7 +16,9 @@ from .config import Settings
 
 
 NODE_PROBE_TIMEOUT_SECONDS = 5
+ROLE_DETECTION_TIMEOUT_SECONDS = 15
 JOB_SUBMISSION_GRACE_SECONDS = 10
+PROCESS_SNAPSHOT_COMMAND = "ps -eo comm=,args= --no-headers"
 
 
 @dataclass(slots=True)
@@ -26,6 +28,15 @@ class SaltJobResult:
     exit_code: int | None = None
     stdout: str = ""
     stderr: str = ""
+    failure_reason: str | None = None
+
+
+@dataclass(slots=True)
+class SaltProcessSnapshot:
+    """单个 Minion 的进程快照结果；原始文本只供内存匹配使用。"""
+
+    state: str
+    process_text: str = ""
     failure_reason: str | None = None
 
 
@@ -42,6 +53,7 @@ class SaltAdapter(Protocol):
     def ping(self, node_id: str) -> bool: ...
     def ping_many(self, node_ids: list[str]) -> dict[str, bool]: ...
     def node_info(self, node_id: str) -> dict[str, Any]: ...
+    def process_snapshot_many(self, node_ids: list[str]) -> dict[str, SaltProcessSnapshot]: ...
     def transfer_package(self, node_id: str, salt_source: str, target_path: str) -> None: ...
     def prepare_workdir(self, node_id: str, archive_path: str, workdir: str) -> None: ...
     def start_step(self, node_id: str, executor_type: str, script: str, workdir: str, stdout_path: str, stderr_path: str, exit_path: str) -> str: ...
@@ -106,6 +118,26 @@ class FakeSaltAdapter:
         if node_id not in self._accepted:
             raise RuntimeError("Minion 不存在")
         return dict(self._accepted[node_id])
+
+    def process_snapshot_many(self, node_ids: list[str]) -> dict[str, SaltProcessSnapshot]:
+        """用一次 Fake 调用返回多节点进程文本，并支持节点级失败测试。"""
+
+        snapshots: dict[str, SaltProcessSnapshot] = {}
+        for node_id in node_ids:
+            node = self._accepted.get(node_id)
+            if node is None or node.get("offline"):
+                snapshots[node_id] = SaltProcessSnapshot(state="FAILED", failure_reason="NODE_NO_RESPONSE")
+            elif node.get("process_error"):
+                snapshots[node_id] = SaltProcessSnapshot(
+                    state="FAILED",
+                    failure_reason=str(node["process_error"]),
+                )
+            else:
+                process_text = node.get("process_text")
+                if process_text is None:
+                    process_text = "\n".join(str(item) for item in node.get("processes", []))
+                snapshots[node_id] = SaltProcessSnapshot(state="SUCCESS", process_text=str(process_text))
+        return snapshots
 
     def transfer_package(self, node_id: str, salt_source: str, target_path: str) -> None:
         """模拟 Fileserver 下载，并记录目标路径供后续断言。"""
@@ -236,7 +268,7 @@ class HttpSaltAdapter:
         with self._submission_lock:
             self._submitted_at.pop(jid, None)
 
-    def _login(self) -> None:
+    def _login(self, timeout_seconds: float | None = None) -> None:
         """使用外部认证登录并在真实到期时间前 30 秒刷新 Token。"""
         response = httpx.post(
             f"{self.settings.salt_api_url.rstrip('/')}/login",
@@ -246,26 +278,49 @@ class HttpSaltAdapter:
                 "eauth": self.settings.salt_eauth,
             },
             headers={"Accept": "application/json"},
-            timeout=self.settings.salt_request_timeout,
+            timeout=timeout_seconds or self.settings.salt_request_timeout,
         )
         response.raise_for_status()
         payload = response.json()["return"][0]
         self._token = payload["token"]
         self._token_expire = float(payload.get("expire", time.time() + 600)) - 30
 
-    def _request(self, data: dict[str, Any], retry_auth: bool = True) -> Any:
-        """发送一个 Salt 请求；401 时只重新登录并重放一次，避免无限递归。"""
+    def _request(
+        self,
+        data: dict[str, Any],
+        retry_auth: bool = True,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+    ) -> Any:
+        """发送一个 Salt 请求；可选 deadline 覆盖登录、重认证和业务请求总时长。"""
+
+        if deadline is None and timeout_seconds is not None:
+            deadline = time.monotonic() + timeout_seconds
+
+        def request_timeout() -> float:
+            if deadline is None:
+                return float(self.settings.salt_request_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise httpx.TimeoutException("Salt request deadline exceeded")
+            return remaining
+
         if not self._token or time.time() >= self._token_expire:
-            self._login()
+            self._login(request_timeout())
         response = httpx.post(
             self.settings.salt_api_url,
             data=data,
             headers={"Accept": "application/json", "X-Auth-Token": self._token},
-            timeout=self.settings.salt_request_timeout,
+            timeout=request_timeout(),
         )
         if response.status_code == 401 and retry_auth:
-            self._login()
-            return self._request(data, retry_auth=False)
+            self._login(request_timeout())
+            return self._request(
+                data,
+                retry_auth=False,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+            )
         response.raise_for_status()
         return response.json().get("return", [None])[0]
 
@@ -342,6 +397,45 @@ class HttpSaltAdapter:
             "hostname": grains.get("host", node_id),
             "management_ip": management_ip,
         }
+
+    def process_snapshot_many(self, node_ids: list[str]) -> dict[str, SaltProcessSnapshot]:
+        """用一次 list targeting 读取进程快照，且不执行 grains 或服务查询。
+
+        命令是应用内固定常量，RoleRule pattern 只在本地 Python 中匹配，绝不会
+        拼接进远端 Shell。登录、重认证、业务 HTTP 请求和 Salt publish 共享 15 秒
+        deadline，避免坏节点让识别请求等待数分钟。
+        """
+
+        if not node_ids:
+            return {}
+        result = self._request(
+            {
+                "client": "local",
+                "tgt": ",".join(node_ids),
+                "tgt_type": "list",
+                "fun": "cmd.run_all",
+                "arg": PROCESS_SNAPSHOT_COMMAND,
+                "timeout": ROLE_DETECTION_TIMEOUT_SECONDS,
+            },
+            timeout_seconds=ROLE_DETECTION_TIMEOUT_SECONDS,
+        )
+        values = result if isinstance(result, dict) else {}
+        snapshots: dict[str, SaltProcessSnapshot] = {}
+        for node_id in node_ids:
+            value = values.get(node_id)
+            if isinstance(value, dict) and int(value.get("retcode", 1)) == 0:
+                snapshots[node_id] = SaltProcessSnapshot(
+                    state="SUCCESS",
+                    process_text=str(value.get("stdout", "")),
+                )
+            elif isinstance(value, dict):
+                snapshots[node_id] = SaltProcessSnapshot(
+                    state="FAILED",
+                    failure_reason=f"PROCESS_SNAPSHOT_EXIT_{int(value.get('retcode', 1))}",
+                )
+            else:
+                snapshots[node_id] = SaltProcessSnapshot(state="FAILED", failure_reason="NODE_NO_RESPONSE")
+        return snapshots
 
     def transfer_package(self, node_id: str, salt_source: str, target_path: str) -> None:
         """让 Minion 从只读 Fileserver 下载已校验的内层包。"""

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Annotated, Any, Iterator
+from typing import Annotated, Any, Iterator, Literal
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .config import GIB, MIB, Settings
@@ -20,6 +21,8 @@ from .models import (
     Node,
     NodeRole,
     Package,
+    RoleDetectionJob,
+    RoleDetectionNodeResult,
     RoleRule,
     SessionRecord,
     SystemSetting,
@@ -31,6 +34,13 @@ from .models import (
 )
 from .node_service import apply_node_snapshots, collect_node_snapshots, probe_node
 from .package_service import create_package, delete_package, update_package
+from .role_detection import (
+    RoleValidationError,
+    create_role_detection_job,
+    normalize_role_label,
+    normalize_role_labels,
+    normalize_rule_pattern,
+)
 from .salt import SaltAdapter
 from .security import create_login_session, decrypt_secret, encrypt_secret, sha256_text, verify_password
 from .task_service import aggregate_task, cancel_task_node, create_task, effective_roles, retry_task_node, task_preview
@@ -45,8 +55,16 @@ class LoginRequest(BaseModel):
 class TaskPreviewRequest(BaseModel):
     """任务预览目标；角色和直接节点会在 Service 中取并集。"""
     package_id: str
-    role_names: list[str] = Field(default_factory=list)
+    role_names: list[str] = Field(default_factory=list, max_length=200)
     node_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("role_names")
+    @classmethod
+    def validate_role_names(cls, value: list[str]) -> list[str]:
+        try:
+            return normalize_role_labels(value)
+        except RoleValidationError as exc:
+            raise ValueError(str(exc)) from None
 
 
 class TaskCreateRequest(TaskPreviewRequest):
@@ -56,10 +74,35 @@ class TaskCreateRequest(TaskPreviewRequest):
 
 
 class NodeUpdateRequest(BaseModel):
-    """节点启停和人工角色请求；restore_auto_roles 仅保留历史兼容性。"""
+    """节点启停和人工角色请求；roles 表示编辑后的完整有效标签集合。"""
     enabled: bool | None = None
-    roles: list[str] | None = None
+    roles: list[str] | None = Field(default=None, max_length=200)
     restore_auto_roles: bool = False
+
+
+class RoleRuleRequest(BaseModel):
+    """System Settings 中仅支持的进程字面匹配规则。"""
+
+    role: str
+    matcher_type: Literal["process"] = "process"
+    pattern: str
+    enabled: bool = True
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        try:
+            return normalize_role_label(value)
+        except RoleValidationError as exc:
+            raise ValueError(str(exc)) from None
+
+    @field_validator("pattern")
+    @classmethod
+    def validate_pattern(cls, value: str) -> str:
+        try:
+            return normalize_rule_pattern(value)
+        except RoleValidationError as exc:
+            raise ValueError(str(exc)) from None
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -74,7 +117,7 @@ class SettingsUpdateRequest(BaseModel):
     default_step_timeout: int | None = Field(default=None, ge=1, le=86400)
     execution_log_retention_days: int | None = Field(default=None, ge=1, le=365)
     node_status_check_interval: int | None = Field(default=None, ge=5, le=3600)
-    role_detection_rules: list[dict[str, Any]] | None = None
+    role_detection_rules: list[RoleRuleRequest] | None = Field(default=None, max_length=200)
 
 
 def _iso(value):
@@ -99,7 +142,10 @@ def audit(session: Session, request: Request, operation: str, object_type: str, 
 
 
 def serialize_node(node: Node) -> dict[str, Any]:
-    """序列化节点，并按历史 source 兼容规则返回有效角色。"""
+    """序列化节点，并同时返回合并标签和可解释的来源列表。"""
+    sources_by_role: dict[str, set[str]] = {}
+    for role in node.roles:
+        sources_by_role.setdefault(role.role, set()).add(role.source)
     return {
         "id": node.id,
         "hostname": node.hostname,
@@ -107,11 +153,53 @@ def serialize_node(node: Node) -> dict[str, Any]:
         "online_status": node.online_status,
         "enabled": node.enabled,
         "roles": effective_roles(node),
+        "role_details": [
+            {"role": role, "sources": sorted(sources)}
+            for role, sources in sorted(sources_by_role.items())
+        ],
         "role_override": node.role_override,
         "last_check_time": _iso(node.last_check_time),
         "created_at": _iso(node.created_at),
         "updated_at": _iso(node.updated_at),
     }
+
+
+def serialize_role_detection_result(result: RoleDetectionNodeResult) -> dict[str, Any]:
+    """返回节点识别快照和结构化结果，不包含原始进程命令行。"""
+
+    return {
+        "id": result.id,
+        "node_id": result.node_id,
+        "node_id_snapshot": result.node_id_snapshot,
+        "hostname_snapshot": result.hostname_snapshot,
+        "status": result.status,
+        "matched_roles": json.loads(result.matched_roles_json),
+        "added_roles": json.loads(result.added_roles_json),
+        "failure_reason": result.failure_reason,
+        "finished_at": _iso(result.finished_at),
+    }
+
+
+def serialize_role_detection_job(job: RoleDetectionJob, include_results: bool = False) -> dict[str, Any]:
+    """返回角色识别任务摘要；详情接口额外附带规则和逐节点结果。"""
+
+    payload: dict[str, Any] = {
+        "id": job.id,
+        "status": job.status,
+        "total_node_count": job.total_node_count,
+        "target_node_count": job.target_node_count,
+        "success_count": job.success_count,
+        "failed_count": job.failed_count,
+        "skipped_count": job.skipped_count,
+        "failure_reason": job.failure_reason,
+        "created_at": _iso(job.created_at),
+        "started_at": _iso(job.started_at),
+        "finished_at": _iso(job.finished_at),
+    }
+    if include_results:
+        payload["rules"] = json.loads(job.rules_snapshot_json)
+        payload["results"] = [serialize_role_detection_result(result) for result in job.results]
+    return payload
 
 
 def serialize_package(package: Package, include_steps: bool = False) -> dict[str, Any]:
@@ -343,32 +431,117 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
         session.commit()
         return [serialize_node(node) for node in nodes]
 
+    @protected.post(
+        "/nodes/role-detection-jobs",
+        dependencies=[Depends(require_csrf)],
+        status_code=202,
+        summary="创建自动角色识别任务",
+    )
+    def start_role_detection(request: Request, session: Session = Depends(get_session)):
+        """快照在线节点和进程规则；后台 Worker 稍后执行唯一活动任务。"""
+
+        active = session.scalar(
+            select(RoleDetectionJob)
+            .where(RoleDetectionJob.status.in_(["WAITING", "RUNNING"]))
+            .order_by(RoleDetectionJob.created_at)
+            .limit(1)
+        )
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ROLE_DETECTION_ALREADY_RUNNING", "active_job_id": active.id},
+            )
+        try:
+            job = create_role_detection_job(session)
+        except RoleValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        audit(
+            session,
+            request,
+            "CREATE_ROLE_DETECTION_JOB",
+            "ROLE_DETECTION_JOB",
+            job.id,
+            {"target_node_count": job.target_node_count, "skipped_count": job.skipped_count},
+        )
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            # active_slot 唯一约束是并发创建的最终防线。
+            session.rollback()
+            active_id = session.scalar(
+                select(RoleDetectionJob.id)
+                .where(RoleDetectionJob.status.in_(["WAITING", "RUNNING"]))
+                .order_by(RoleDetectionJob.created_at)
+                .limit(1)
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ROLE_DETECTION_ALREADY_RUNNING", "active_job_id": active_id},
+            ) from exc
+        return serialize_role_detection_job(job, include_results=True)
+
+    @protected.get("/nodes/role-detection-jobs", summary="查询自动角色识别任务")
+    def list_role_detection_jobs(
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+        session: Session = Depends(get_session),
+    ):
+        """按创建时间倒序返回有限数量的识别任务摘要。"""
+
+        jobs = session.scalars(
+            select(RoleDetectionJob).order_by(RoleDetectionJob.created_at.desc()).limit(limit)
+        ).all()
+        return [serialize_role_detection_job(job) for job in jobs]
+
+    @protected.get("/nodes/role-detection-jobs/{job_id}", summary="查询自动角色识别任务详情")
+    def get_role_detection_job(job_id: str, session: Session = Depends(get_session)):
+        """返回规则快照和所有节点结果，用于页面轮询及历史解释。"""
+
+        job = session.scalar(
+            select(RoleDetectionJob)
+            .where(RoleDetectionJob.id == job_id)
+            .options(selectinload(RoleDetectionJob.results))
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="角色识别任务不存在")
+        return serialize_role_detection_job(job, include_results=True)
+
     @protected.patch("/nodes/{node_id}", dependencies=[Depends(require_csrf)], summary="更新节点")
     def update_node(node_id: str, payload: NodeUpdateRequest, request: Request, session: Session = Depends(get_session)):
-        """启停节点或设置人工角色；可兼容恢复已有 auto 历史记录。"""
+        """启停节点或编辑合并标签；人工操作不再整体覆盖自动识别结果。"""
         node = session.scalar(select(Node).where(Node.id == node_id).options(selectinload(Node.roles)))
         if node is None:
             raise HTTPException(status_code=404, detail="Node 不存在")
+        if payload.restore_auto_roles and payload.roles is not None:
+            raise HTTPException(status_code=422, detail="roles 与 restore_auto_roles 不能同时提交")
         if payload.enabled is not None:
             node.enabled = payload.enabled
         if payload.restore_auto_roles:
-            node.role_override = False
             node.roles[:] = [role for role in node.roles if role.source != "manual"]
         elif payload.roles is not None:
-            node.role_override = True
-            node.roles[:] = [role for role in node.roles if role.source != "manual"]
-            for role in sorted(set(payload.roles)):
+            try:
+                requested_roles = set(normalize_role_labels(payload.roles))
+            except RoleValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            # 删除用户从最终集合中移除的标签；保留其余标签的 auto/manual 来源。
+            node.roles[:] = [role for role in node.roles if role.role in requested_roles]
+            existing_roles = {role.role for role in node.roles}
+            for role in sorted(requested_roles - existing_roles):
                 node.roles.append(NodeRole(role=role, source="manual"))
+        node.role_override = False
         audit(session, request, "UPDATE_NODE", "NODE", node_id, payload.model_dump(exclude_none=True))
         session.commit()
         return serialize_node(node)
 
     @protected.delete("/nodes/{node_id}", dependencies=[Depends(require_csrf)], status_code=204, summary="删除节点")
     def remove_node(node_id: str, request: Request, session: Session = Depends(get_session)):
-        """删除无 Waiting/Running 引用的当前节点对象。"""
+        """删除无 Waiting/Running 引用的离线节点对象，不删除 Salt Minion Key。"""
         node = session.get(Node, node_id)
         if node is None:
             raise HTTPException(status_code=404, detail="Node 不存在")
+        # 页面只向 Offline 节点展示删除入口，API 仍需重复校验，防止绕过
+        # 前端或在状态变化竞争中误删仍在线的节点。
+        if node.online_status != "OFFLINE":
+            raise HTTPException(status_code=409, detail="仅允许删除 Offline 节点")
         active = session.scalar(
             select(func.count()).select_from(TaskNode).where(
                 TaskNode.node_id == node_id,
@@ -600,8 +773,20 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
         values = {item.key: item.value for item in session.scalars(select(SystemSetting))}
         # API 永不解密回显 credential，避免明文进入浏览器、日志或网络调试记录。
         values["salt_api_credential"] = "********" if values.get("salt_api_credential") else ""
-        if "role_detection_rules" in values:
-            values["role_detection_rules"] = json.loads(values["role_detection_rules"])
+        # RoleRule 表是识别执行的唯一事实来源，避免重复 JSON 与实际规则漂移。
+        values["role_detection_rules"] = [
+            {
+                "role": rule.role,
+                "matcher_type": "process",
+                "pattern": rule.pattern,
+                "enabled": rule.enabled,
+            }
+            for rule in session.scalars(
+                select(RoleRule)
+                .where(RoleRule.matcher_type == "process")
+                .order_by(RoleRule.role, RoleRule.pattern, RoleRule.id)
+            )
+        ]
         for key in ["salt_request_timeout", "max_upload_size", "default_step_timeout", "execution_log_retention_days", "node_status_check_interval"]:
             if key in values:
                 values[key] = int(values[key])
@@ -613,13 +798,17 @@ def create_api_router(settings: Settings, get_session, salt: SaltAdapter, requir
         updates = payload.model_dump(exclude_none=True)
         if "role_detection_rules" in updates:
             rules = updates.pop("role_detection_rules")
-            if len(rules) > 200:
-                raise HTTPException(status_code=422, detail="角色识别规则不得超过 200 条")
+            identities = {(item["role"], item["pattern"]) for item in rules}
+            if len(identities) != len(rules):
+                raise HTTPException(status_code=422, detail="角色识别规则不得重复")
             session.query(RoleRule).delete()
             for item in rules:
-                if item.get("matcher_type") not in {"process", "service"} or not item.get("role") or not item.get("pattern"):
-                    raise HTTPException(status_code=422, detail="角色规则必须包含 role、matcher_type(process/service)、pattern")
-                session.add(RoleRule(role=str(item["role"]), matcher_type=str(item["matcher_type"]), pattern=str(item["pattern"]), enabled=bool(item.get("enabled", True))))
+                session.add(RoleRule(
+                    role=item["role"],
+                    matcher_type="process",
+                    pattern=item["pattern"],
+                    enabled=item["enabled"],
+                ))
             updates["role_detection_rules"] = json.dumps(rules, ensure_ascii=False)
         for key, value in updates.items():
             sensitive = key == "salt_api_credential"
