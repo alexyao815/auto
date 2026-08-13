@@ -13,7 +13,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AUTOMATION_CENTER_BACKEND_ROOT=/app/backend
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx supervisor curl ca-certificates \
+    && apt-get install -y --no-install-recommends nginx supervisor curl ca-certificates coreutils \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /app --shell /usr/sbin/nologin automation
 COPY backend/ /app/backend/

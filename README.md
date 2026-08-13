@@ -181,18 +181,20 @@ npm run dev
 
 ## 维护包协议
 
-当前实现要求外层归档严格包含：
+外层归档文件名任意；解压后忽略目录项，必须恰好包含两个普通文件：
 
 ```text
-inner-package.tar.gz
-inner-package.sha256
+<任意名称>.tar 或 <任意名称>.tar.gz
+<任意前缀>sha256
 ```
 
-SHA 文件必须使用标准格式：64 位 SHA-256、两个空格、固定文件名 `inner-package.tar.gz`。内层包包含 `manifest.yaml`、Shell/Python 脚本和脚本需要的资源文件；`manifest_version` 必须为 `1`。
+系统按 `*sha256` 找出唯一校验文件，并按标准 `sha256sum -c` 语义校验其中记录的内层包。SHA 文件必须包含 64 位摘要、两个空格和内层包的实际 basename；记录名称必须与另一个文件完全一致。内层包支持普通 `.tar` 和 `.tar.gz`，包含 `manifest.yaml`、Shell/Python 脚本和资源文件；`manifest_version` 必须为 `1`。
+
+生产镜像显式安装 `coreutils` 以提供 `sha256sum`；Windows 本地开发环境找不到该命令时，后端使用等价的流式 SHA-256 算法完成校验。
 
 上传校验会拒绝绝对路径、`..`、目录逃逸、重复路径、符号链接、硬链接、设备文件、超限文件数和解压炸弹。开发者可以使用 [`scripts/build_demo_package.py`](scripts/build_demo_package.py) 查看最小合法包结构。
 
-部分早期设计文档仍保留 `payload.tar.gz`/`payload.sha256` 示例；当前代码、`需求文档.md` 和本 README 中的 `inner-package.*` 协议优先。
+早期文档中的 `payload.*` 或 `inner-package.*` 都是合法示例名，不再是固定协议文件名；当前代码和本 README 的“两文件 + `*sha256` 引用实际包名”规则优先。
 
 ## 生产部署
 

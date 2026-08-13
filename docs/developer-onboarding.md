@@ -158,7 +158,7 @@ Fake Salt 不会在本机真正执行包内脚本；它按确定性契约模拟 
 
 ### 5.5 Package 是不可信输入
 
-上传始终流式写盘。外层包必须包含 `inner-package.tar.gz` 和 `inner-package.sha256`；SHA 文件格式为 64 位摘要、两个空格、固定文件名。校验会拒绝路径穿越、绝对路径、重复路径、链接、设备文件、过大 Manifest、过多文件和解压后超限。
+上传始终流式写盘。外层包忽略目录项后必须恰好包含两个普通文件：一个任意名称的 `.tar`/`.tar.gz` 内层包，以及唯一一个名称以 `sha256` 结尾的文本文件。系统按标准 `sha256sum -c` 单行格式读取摘要和实际包名；两者匹配后才继续校验 Manifest。校验会拒绝路径穿越、绝对路径、重复路径、链接、设备文件、额外文件、过大 Manifest、过多文件和解压后超限。
 
 Update 先在临时目录完成校验，再切换到新 Revision；Waiting/Running 引用存在时返回 409。历史 Task 依赖快照，不依赖当前 Package 文件。
 
@@ -201,7 +201,7 @@ Scheduler.run
 - 健康检查：`GET http://127.0.0.1:8080/api/v1/health/live` 和 `/health/ready`。
 - OpenAPI：`http://127.0.0.1:8080/docs`。
 - SQLite：`data/db/automation-center.db`。
-- Package：`data/packages/<package-id>/v<revision>/inner-package.tar.gz`。
+- Package：`data/packages/<package-id>/v<revision>/<SHA 文件记录的实际内层包名>`。
 - 日志：`data/logs/<task-id>/<task-node-id>/attempt-<n>/`。
 - 备份：`data/backups/`。
 
@@ -248,4 +248,4 @@ npm run test:e2e
 3. 状态机、出包规范和架构设计文档。
 4. `1 自动化中心.md` 只作为已验证 Salt 环境参考。
 
-当前代码和本指南使用 `inner-package.tar.gz` 与 `inner-package.sha256`。旧文档中出现的其他外层文件名不能覆盖当前已确认实现。自动化测试边界见 `docs/test-cases.md`；其中真实 Salt、CentOS 容器、30 节点和 10 GiB 容量项仍需目标环境验收。
+当前代码允许内层包使用任意 `.tar`/`.tar.gz` 名称，并通过唯一的 `*sha256` 文件发现和校验它；`inner-package.*` 只是开发脚本生成的示例名。自动化测试边界见 `docs/test-cases.md`；其中真实 Salt、CentOS 容器、30 节点和 10 GiB 容量项仍需目标环境验收。

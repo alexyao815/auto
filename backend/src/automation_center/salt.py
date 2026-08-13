@@ -350,10 +350,10 @@ class HttpSaltAdapter:
             raise RuntimeError("PackageTransferFailed")
 
     def prepare_workdir(self, node_id: str, archive_path: str, workdir: str) -> None:
-        """在远端创建隔离工作目录并解压内层包。"""
+        """在远端创建隔离目录；GNU tar 自动识别普通 tar 和 gzip tar。"""
         import shlex
         # 所有来自任务快照的路径都经 shell quoting，不能直接拼接成命令参数。
-        command = f"mkdir -p {shlex.quote(workdir)} && tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(workdir)}"
+        command = f"mkdir -p {shlex.quote(workdir)} && tar -xf {shlex.quote(archive_path)} -C {shlex.quote(workdir)}"
         result = self._local(node_id, "cmd.run_all", [command]) or {}
         if int(result.get("retcode", 1)) != 0:
             raise RuntimeError(f"PackageExtractFailed: {result.get('stderr', '')}")

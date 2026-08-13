@@ -86,6 +86,9 @@ def test_http_adapter_contract(monkeypatch, settings):
     assert local_calls[details_start:] == [("node1", "grains.item", ["host", "ipv4"], None, None)]
     adapter.transfer_package("node1", "salt://x", "/tmp/x")
     adapter.prepare_workdir("node1", "/tmp/x", "/tmp/work")
+    prepare_command = next(str(call[2]) for call in local_calls if call[1] == "cmd.run_all")
+    assert "tar -xf /tmp/x" in prepare_command
+    assert "tar -xzf" not in prepare_command
     jid = adapter.start_step("node1", "shell", "x.sh", "/tmp/work", "/tmp/o", "/tmp/e", "/tmp/x")
     assert jid == "202601010000"
     assert jid in adapter._submitted_at

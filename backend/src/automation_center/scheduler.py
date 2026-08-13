@@ -275,9 +275,10 @@ class Scheduler:
                 return
             node_id = task_node.node_id
             remote_root = f"/var/lib/automation-center/tasks/{task.id}/attempt-{attempt.attempt_no}"
-            remote_archive = f"{remote_root}/inner-package.tar.gz"
+            archive_name = Path(package.storage_path).name
+            remote_archive = f"{remote_root}/{archive_name}"
             remote_work = f"{remote_root}/work"
-            salt_source = f"salt://{package.id}/v{package.revision}/inner-package.tar.gz"
+            salt_source = f"salt://{package.id}/v{package.revision}/{archive_name}"
             # 先结束读取事务再调用 Salt；包传输和解压期间不占用 SQLite 事务。
             session.commit()
             try:

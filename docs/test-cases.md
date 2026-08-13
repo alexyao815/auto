@@ -45,9 +45,10 @@
 | ID | 场景与操作 | 预期结果 | 层级/状态 |
 |---|---|---|---|
 | PKG-01 | 上传合法外层包 | 流式落盘、校验成功、Revision=1、解析 Steps | 集成/A-已通过 |
-| PKG-02 | 外层缺少 inner-package.tar.gz 或 SHA 文件 | 返回 422，临时文件清理 | API/E-扩展自动化 |
-| PKG-03 | SHA 行不是 64 位摘要、两个空格和固定文件名 | 拒绝上传 | 单元/A-已通过 |
-| PKG-04 | 摘要与 inner 包不一致 | 拒绝上传且不创建 Package | API/A-已通过 |
+| PKG-02 | 外层不是恰好一个 `.tar`/`.tar.gz` 和一个 `*sha256` 文件 | 返回 422，临时文件清理 | API/A-已通过 |
+| PKG-03 | SHA 行不是 64 位摘要、两个空格和实际包名 | 拒绝上传 | 单元/A-已通过 |
+| PKG-04 | 摘要或 SHA 中记录的包名与实际内层包不一致 | 拒绝上传且不创建 Package | API/A-已通过 |
+| PKG-04A | 任意内层包名和校验文件名 | 从 `*sha256` 内容读取包名，普通 tar/tar.gz 均通过 | API/A-已通过 |
 | PKG-05 | manifest 缺失或超过 1 MiB | 拒绝上传 | 单元；大小上限 A-已通过，缺失 E-扩展自动化 |
 | PKG-06 | manifest_version 缺失或不为 1 | 拒绝上传 | API/A-已通过 |
 | PKG-07 | Executor 不是 Shell/Python | 拒绝上传 | API/A-已通过 |
